@@ -1,18 +1,22 @@
-generator client {
-  provider = "prisma-client-js"
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  totpSecret   String?
+  createdAt    DateTime @default(now())
 }
 
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+model Org {
+  id          String   @id @default(cuid())
+  ownerUserId String
+  name        String   @default("My Org")
+  createdAt   DateTime @default(now())
 }
 
-model Device {
+model Member {
   id        String   @id @default(cuid())
-  userId    String?
-  orgId     String?
-  platform  String
-  pushToken String
+  orgId     String
+  userId    String
+  role      String   @default("owner")
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
 }
