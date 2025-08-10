@@ -34,4 +34,17 @@ app.post("/devices/register", async (req, res) => {
 });
 
 const port = process.env.PORT || 8080;
+
+app.get("/", (_req, res) => {
+  res.type("html").send(`
+    <h1>Bedrock Backend</h1>
+    <p>Status: <a href="/healthz">/healthz</a></p>
+    <p>POST <code>/devices/register</code> with JSON:
+    <pre>{
+  "platform": "android",
+  "push_token": "TEST-TOKEN-123"
+}</pre>
+  `);
+});
+
 app.listen(port, () => console.log(`API up on :${port}`));
