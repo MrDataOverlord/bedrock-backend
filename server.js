@@ -2,6 +2,8 @@ import express from "express";
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
+import bodyParser from "body-parser";
+import Stripe from "stripe";
 
 import { prisma } from "./db.js";
 import {
@@ -11,18 +13,19 @@ import {
 
 const app = express();
 
-// IMPORTANT: trust Render's proxy BEFORE any middleware (fixes express-rate-limit IP warning)
+// 1) Proxy & security
 app.set("trust proxy", 1);
-
-// ---- middleware ----
 app.use(helmet());
+
+// 2) Stripe webhook must receive the *raw* body BEFORE express.json()
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
+app.use("/webhooks/stripe", bodyParser.raw({ type: "application/json" }));
+
+// 3) Normal JSON parsing + CORS + rate-limit
 app.use(express.json({ limit: "256kb" }));
 
-// CORS allowlist via env (empty = allow any origin; tighten later)
 const ALLOWED = (process.env.CORS_ORIGINS || "")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(",").map(s => s.trim()).filter(Boolean);
 
 app.use(cors({
   origin(origin, cb) {
@@ -31,13 +34,10 @@ app.use(cors({
   }
 }));
 
-// basic rate limit
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
-// ---- health ----
+// ---- health & root ----
 app.get("/healthz", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
-
-// ---- friendly root page ----
 app.get("/", (_req, res) => {
   res.type("html").send(`
     <h1>Bedrock Backend</h1>
@@ -55,6 +55,11 @@ app.get("/", (_req, res) => {
       <li>POST <code>/auth/totp/verify</code> {"code"}</li>
       <li>GET  <code>/entitlements</code> (Bearer token)</li>
     </ul>
+    <p>Billing (test):</p>
+    <ul>
+      <li>POST <code>/billing/force-active</code> (Bearer token) → marks org premium</li>
+      <li>POST <code>/webhooks/stripe</code> (Stripe) → auto-updates subscription</li>
+    </ul>
   `);
 });
 
@@ -62,16 +67,9 @@ app.get("/", (_req, res) => {
 app.post("/devices/register", async (req, res) => {
   try {
     const { platform, push_token, user_id, org_id } = req.body || {};
-    if (!platform || !push_token) {
-      return res.status(400).json({ error: "platform and push_token required" });
-    }
+    if (!platform || !push_token) return res.status(400).json({ error: "platform and push_token required" });
     const device = await prisma.device.create({
-      data: {
-        platform,
-        pushToken: push_token,
-        userId: user_id || null,
-        orgId: org_id || null
-      }
+      data: { platform, pushToken: push_token, userId: user_id || null, orgId: org_id || null }
     });
     res.json({ ok: true, id: device.id });
   } catch (e) {
@@ -80,7 +78,7 @@ app.post("/devices/register", async (req, res) => {
   }
 });
 
-// ---- auth: signup ----
+// ---- auth: signup/login ----
 app.post("/auth/signup", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
@@ -98,7 +96,6 @@ app.post("/auth/signup", async (req, res) => {
   }
 });
 
-// ---- auth: login ----
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
@@ -114,7 +111,7 @@ app.post("/auth/login", async (req, res) => {
   res.json({ ok: true, access, refresh, has2fa: !!user.totpSecret });
 });
 
-// ---- 2FA: enable ----
+// ---- 2FA: TOTP enable/verify ----
 app.post("/auth/totp/enable", async (req, res) => {
   try {
     const token = (req.headers.authorization || "").replace("Bearer ", "");
@@ -127,7 +124,6 @@ app.post("/auth/totp/enable", async (req, res) => {
   }
 });
 
-// ---- 2FA: verify ----
 app.post("/auth/totp/verify", async (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: "code required" });
@@ -145,16 +141,73 @@ app.post("/auth/totp/verify", async (req, res) => {
   }
 });
 
-// ---- entitlements (72h grace; premium=false for now) ----
+// ---- Billing: Stripe webhook (step 4) ----
+app.post("/webhooks/stripe", async (req, res) => {
+  try {
+    const sig = req.headers["stripe-signature"];
+    const event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+
+    if (event.type === "checkout.session.completed" || event.type === "invoice.payment_succeeded") {
+      const obj = event.data.object;
+      const orgId = obj.metadata?.orgId;
+      if (orgId) {
+        const subId = `stripe_${obj.subscription || obj.id}`;
+        const periodEnd = new Date(((obj.current_period_end || obj.period_end) ?? Math.floor(Date.now()/1000)) * 1000);
+        await prisma.subscription.upsert({
+          where: { id: subId },
+          update: { status: "active", currentPeriodEnd: periodEnd },
+          create: { id: subId, orgId, provider: "stripe", status: "active", currentPeriodEnd: periodEnd }
+        });
+      }
+    }
+
+    if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
+      const sub = event.data.object;
+      await prisma.subscription.updateMany({
+        where: { id: `stripe_${sub.id}` },
+        data: { status: sub.status, currentPeriodEnd: new Date(sub.current_period_end * 1000) }
+      });
+    }
+
+    res.json({ received: true });
+  } catch (e) {
+    console.error("stripe webhook error", e?.message || e);
+    res.status(400).send("Webhook Error");
+  }
+});
+
+// ---- Billing: manual toggle for testing (no Stripe needed) ----
+app.post("/billing/force-active", async (req, res) => {
+  try {
+    const token = (req.headers.authorization || "").replace("Bearer ", "");
+    const { orgId } = verifyJwt(token);
+    await prisma.subscription.upsert({
+      where: { id: `manual_${orgId}` },
+      update: { status: "active" },
+      create: { id: `manual_${orgId}`, orgId, provider: "manual", status: "active" }
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("force-active error", e);
+    res.status(401).json({ error: "invalid token" });
+  }
+});
+
+// ---- Entitlements (step 5: premium-aware) ----
 app.get("/entitlements", async (req, res) => {
   try {
     const token = (req.headers.authorization || "").replace("Bearer ", "");
     const payload = verifyJwt(token);
 
+    const subs = await prisma.subscription.findMany({
+      where: { orgId: payload.orgId, status: "active" }
+    });
+    const isPremium = subs.length > 0;
+
     const entitlement = {
       uid: payload.uid,
       orgId: payload.orgId,
-      features: ["basic"], // flip to ["premium"] after Stripe/PayPal hook
+      features: isPremium ? ["premium"] : ["basic"],
       expiry: Date.now() + 72 * 60 * 60 * 1000
     };
     const signed = signJwt({ ent: entitlement }, "72h");
