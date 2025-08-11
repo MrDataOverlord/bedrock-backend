@@ -196,38 +196,35 @@ app.post("/billing/force-active", async (req, res) => {
     res.status(401).json({ error: "invalid token" });
   }
 });
+
 app.post("/billing/checkout", async (req, res) => {
   try {
-    // Auth
-    const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
     const { orgId } = verifyJwt(token);
 
-    // Build absolute https origins safely
-    const envBase = process.env.APP_DOMAIN?.trim();
-    const base =
-      envBase?.startsWith("http://") || envBase?.startsWith("https://")
-        ? envBase.replace(/\/+$/, "")
-        : `${req.protocol}://${req.get("host")}`;
+    const price = process.env.STRIPE_PRICE_PREMIUM;
+    if (!price) throw new Error("Missing STRIPE_PRICE_PREMIUM env var");
 
-    const successUrl = `${base}/?billing=success`;
-    const cancelUrl  = `${base}/?billing=canceled`;
+    const base = (process.env.APP_DOMAIN?.match(/^https?:\/\//)
+      ? process.env.APP_DOMAIN
+      : `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
 
-    // Create session
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
-      line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      metadata: { orgId },                        // used by your webhook
+      line_items: [{ price, quantity: 1 }],
+      success_url: `${base}/?billing=success`,
+      cancel_url: `${base}/?billing=canceled`,
+      metadata: { orgId },
       subscription_data: { metadata: { orgId } },
     });
 
     res.json({ ok: true, url: session.url });
   } catch (e) {
-    console.error("checkout error", e?.message || e);
-    res.status(400).json({ error: "checkout failed", detail: e?.message || String(e) });
+    console.error("checkout error", e.message || e);
+    res.status(400).json({ error: "checkout failed", detail: e.message || String(e) });
   }
 });
+
 
 
 // ---------- entitlements (premium-aware) ----------
