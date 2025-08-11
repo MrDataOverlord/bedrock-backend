@@ -13,15 +13,53 @@ import {
 
 const app = express();
 
-// 1) Proxy & security
+// ---------- helpers ----------
+const getToken = (req) =>
+  String(req.headers.authorization || "")
+    .replace(/^Bearer\s+/i, "") // case-insensitive, trims extra spaces
+    .trim();
+
+// ---------- proxy & security ----------
 app.set("trust proxy", 1);
 app.use(helmet());
 
-// 2) Stripe webhook must receive the *raw* body BEFORE express.json()
+// ---------- stripe webhook must get RAW body BEFORE express.json ----------
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
-app.use("/webhooks/stripe", bodyParser.raw({ type: "application/json" }));
+app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const sig = req.headers["stripe-signature"];
+    const event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
 
-// 3) Normal JSON parsing + CORS + rate-limit
+    if (event.type === "checkout.session.completed" || event.type === "invoice.payment_succeeded") {
+      const obj = event.data.object;
+      const orgId = obj.metadata?.orgId;
+      if (orgId) {
+        const subId = `stripe_${obj.subscription || obj.id}`;
+        const unix = (obj.current_period_end || obj.period_end || Math.floor(Date.now() / 1000));
+        await prisma.subscription.upsert({
+          where: { id: subId },
+          update: { status: "active", currentPeriodEnd: new Date(unix * 1000) },
+          create: { id: subId, orgId, provider: "stripe", status: "active", currentPeriodEnd: new Date(unix * 1000) }
+        });
+      }
+    }
+
+    if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
+      const sub = event.data.object;
+      await prisma.subscription.updateMany({
+        where: { id: `stripe_${sub.id}` },
+        data: { status: sub.status, currentPeriodEnd: new Date(sub.current_period_end * 1000) }
+      });
+    }
+
+    res.json({ received: true });
+  } catch (e) {
+    console.error("stripe webhook error:", e?.message || e);
+    res.status(400).send("Webhook Error");
+  }
+});
+
+// ---------- normal JSON, CORS, rate limit ----------
 app.use(express.json({ limit: "256kb" }));
 
 const ALLOWED = (process.env.CORS_ORIGINS || "")
@@ -30,13 +68,13 @@ const ALLOWED = (process.env.CORS_ORIGINS || "")
 app.use(cors({
   origin(origin, cb) {
     if (!origin || ALLOWED.length === 0 || ALLOWED.includes(origin)) return cb(null, true);
-    return cb(new Error("Not allowed by CORS"));
+    cb(new Error("Not allowed by CORS"));
   }
 }));
 
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
-// ---- health & root ----
+// ---------- health & root ----------
 app.get("/healthz", (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
 app.get("/", (_req, res) => {
   res.type("html").send(`
@@ -55,15 +93,15 @@ app.get("/", (_req, res) => {
       <li>POST <code>/auth/totp/verify</code> {"code"}</li>
       <li>GET  <code>/entitlements</code> (Bearer token)</li>
     </ul>
-    <p>Billing (test):</p>
+    <p>Billing (test/dev):</p>
     <ul>
       <li>POST <code>/billing/force-active</code> (Bearer token) → marks org premium</li>
-      <li>POST <code>/webhooks/stripe</code> (Stripe) → auto-updates subscription</li>
+      <li>POST <code>/webhooks/stripe</code> (Stripe) → updates subscription</li>
     </ul>
   `);
 });
 
-// ---- devices ----
+// ---------- devices ----------
 app.post("/devices/register", async (req, res) => {
   try {
     const { platform, push_token, user_id, org_id } = req.body || {};
@@ -78,7 +116,7 @@ app.post("/devices/register", async (req, res) => {
   }
 });
 
-// ---- auth: signup/login ----
+// ---------- auth: signup ----------
 app.post("/auth/signup", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
@@ -96,6 +134,7 @@ app.post("/auth/signup", async (req, res) => {
   }
 });
 
+// ---------- auth: login ----------
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "email and password required" });
@@ -111,10 +150,10 @@ app.post("/auth/login", async (req, res) => {
   res.json({ ok: true, access, refresh, has2fa: !!user.totpSecret });
 });
 
-// ---- 2FA: TOTP enable/verify ----
+// ---------- 2FA TOTP ----------
 app.post("/auth/totp/enable", async (req, res) => {
   try {
-    const token = (req.headers.authorization || "").replace("Bearer ", "");
+    const token = getToken(req);
     const payload = verifyJwt(token);
     const { secret, otpauth } = newTotpSecret();
     await prisma.user.update({ where: { id: payload.uid }, data: { totpSecret: secret } });
@@ -128,7 +167,7 @@ app.post("/auth/totp/verify", async (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ error: "code required" });
   try {
-    const token = (req.headers.authorization || "").replace("Bearer ", "");
+    const token = getToken(req);
     const payload = verifyJwt(token);
     const user = await prisma.user.findUnique({ where: { id: payload.uid } });
     if (!user?.totpSecret) return res.status(400).json({ error: "no totp pending" });
@@ -141,45 +180,10 @@ app.post("/auth/totp/verify", async (req, res) => {
   }
 });
 
-// ---- Billing: Stripe webhook (step 4) ----
-app.post("/webhooks/stripe", async (req, res) => {
-  try {
-    const sig = req.headers["stripe-signature"];
-    const event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-
-    if (event.type === "checkout.session.completed" || event.type === "invoice.payment_succeeded") {
-      const obj = event.data.object;
-      const orgId = obj.metadata?.orgId;
-      if (orgId) {
-        const subId = `stripe_${obj.subscription || obj.id}`;
-        const periodEnd = new Date(((obj.current_period_end || obj.period_end) ?? Math.floor(Date.now()/1000)) * 1000);
-        await prisma.subscription.upsert({
-          where: { id: subId },
-          update: { status: "active", currentPeriodEnd: periodEnd },
-          create: { id: subId, orgId, provider: "stripe", status: "active", currentPeriodEnd: periodEnd }
-        });
-      }
-    }
-
-    if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
-      const sub = event.data.object;
-      await prisma.subscription.updateMany({
-        where: { id: `stripe_${sub.id}` },
-        data: { status: sub.status, currentPeriodEnd: new Date(sub.current_period_end * 1000) }
-      });
-    }
-
-    res.json({ received: true });
-  } catch (e) {
-    console.error("stripe webhook error", e?.message || e);
-    res.status(400).send("Webhook Error");
-  }
-});
-
-// ---- Billing: manual toggle for testing (no Stripe needed) ----
+// ---------- billing: manual toggle (dev/testing) ----------
 app.post("/billing/force-active", async (req, res) => {
   try {
-    const token = (req.headers.authorization || "").replace("Bearer ", "");
+    const token = getToken(req);
     const { orgId } = verifyJwt(token);
     await prisma.subscription.upsert({
       where: { id: `manual_${orgId}` },
@@ -193,10 +197,10 @@ app.post("/billing/force-active", async (req, res) => {
   }
 });
 
-// ---- Entitlements (step 5: premium-aware) ----
+// ---------- entitlements (premium-aware) ----------
 app.get("/entitlements", async (req, res) => {
   try {
-    const token = (req.headers.authorization || "").replace("Bearer ", "");
+    const token = getToken(req);
     const payload = verifyJwt(token);
 
     const subs = await prisma.subscription.findMany({
