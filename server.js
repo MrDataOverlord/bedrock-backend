@@ -196,27 +196,39 @@ app.post("/billing/force-active", async (req, res) => {
     res.status(401).json({ error: "invalid token" });
   }
 });
-
 app.post("/billing/checkout", async (req, res) => {
   try {
-    const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    // Auth
+    const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
     const { orgId } = verifyJwt(token);
 
+    // Build absolute https origins safely
+    const envBase = process.env.APP_DOMAIN?.trim();
+    const base =
+      envBase?.startsWith("http://") || envBase?.startsWith("https://")
+        ? envBase.replace(/\/+$/, "")
+        : `${req.protocol}://${req.get("host")}`;
+
+    const successUrl = `${base}/?billing=success`;
+    const cancelUrl  = `${base}/?billing=canceled`;
+
+    // Create session
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       line_items: [{ price: process.env.STRIPE_PRICE_ID, quantity: 1 }],
-      success_url: `${process.env.APP_DOMAIN}/?billing=success`,
-      cancel_url: `${process.env.APP_DOMAIN}/?billing=canceled`,
-      metadata: { orgId },                 // <- used by your webhook
-      subscription_data: { metadata: { orgId } }
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      metadata: { orgId },                        // used by your webhook
+      subscription_data: { metadata: { orgId } },
     });
 
     res.json({ ok: true, url: session.url });
   } catch (e) {
-    console.error("checkout error", e);
-    res.status(400).json({ error: "checkout failed" });
+    console.error("checkout error", e?.message || e);
+    res.status(400).json({ error: "checkout failed", detail: e?.message || String(e) });
   }
 });
+
 
 // ---------- entitlements (premium-aware) ----------
 app.get("/entitlements", async (req, res) => {
