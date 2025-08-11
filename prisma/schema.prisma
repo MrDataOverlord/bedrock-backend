@@ -40,3 +40,16 @@ model Member {
   role      String   @default("owner")
   createdAt DateTime @default(now())
 }
+
+model Subscription {
+  id               String   @id
+  orgId            String
+  org              Org      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  provider         String   @default("manual")      // or 'stripe'
+  status           String   @default("inactive")    // inactive|active|past_due|canceled
+  currentPeriodEnd DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([orgId])
+}
