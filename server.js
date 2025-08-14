@@ -12,18 +12,10 @@ import {
 } from "./auth.js";
 
 const app = express();
-
-// ---------- helpers ----------
-const getToken = (req) =>
-  String(req.headers.authorization || "")
-    .replace(/^Bearer\s+/i, "")
-    .trim();
-
-// ---------- proxy & security ----------
 app.set("trust proxy", 1);
 app.use(helmet());
 
-// ---------- Stripe webhook (raw body FIRST) ----------
+// ---------- Stripe webhook (raw body) BEFORE express.json ----------
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
 
 app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async (req, res) => {
@@ -50,10 +42,9 @@ app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async
     switch (event.type) {
       case "checkout.session.completed": {
         const session = event.data.object;
-        const orgId = session.metadata?.orgId || null;
-        const subIdRaw = session.subscription;
-        if (orgId && subIdRaw) {
-          const sub = await stripe.subscriptions.retrieve(subIdRaw);
+        const orgId = session.metadata?.orgId;
+        if (orgId && session.subscription) {
+          const sub = await stripe.subscriptions.retrieve(session.subscription);
           await upsertActive({
             subId: `stripe_${sub.id}`,
             orgId,
@@ -62,46 +53,37 @@ app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async
         }
         break;
       }
-
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
         const orgId = invoice.metadata?.orgId || invoice.customer;
-        const subIdRaw = invoice.subscription;
         const line = invoice.lines?.data?.[0];
         const periodEndSec = line?.period?.end || null;
-
-        if (orgId && subIdRaw && periodEndSec) {
+        if (orgId && invoice.subscription && periodEndSec) {
           await upsertActive({
-            subId: `stripe_${subIdRaw}`,
+            subId: `stripe_${invoice.subscription}`,
             orgId,
             periodEndSec
           });
         }
         break;
       }
-
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
         const sub = event.data.object;
-        const periodEndSec = sub.current_period_end || Math.floor(Date.now() / 1000);
         await prisma.subscription.updateMany({
           where: { id: `stripe_${sub.id}` },
           data: {
             status: sub.status,
-            currentPeriodEnd: new Date(periodEndSec * 1000)
+            currentPeriodEnd: new Date((sub.current_period_end || Date.now() / 1000) * 1000)
           }
         });
         break;
       }
-
-      default:
-        break;
     }
-
-    return res.json({ received: true });
+    res.json({ received: true });
   } catch (e) {
     console.error("stripe webhook error (handler):", e?.message || e);
-    return res.status(400).send("Webhook Error");
+    res.status(400).send("Webhook Error");
   }
 });
 
