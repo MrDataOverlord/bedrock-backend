@@ -23,39 +23,95 @@ const getToken = (req) =>
 app.set("trust proxy", 1);
 app.use(helmet());
 
-// ---------- stripe webhook must get RAW body BEFORE express.json ----------
+// ---------- Stripe webhook (raw body) ----------
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
+
 app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async (req, res) => {
+  let event;
   try {
     const sig = req.headers["stripe-signature"];
-    const event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-
-    if (event.type === "checkout.session.completed" || event.type === "invoice.payment_succeeded") {
-      const obj = event.data.object;
-      const orgId = obj.metadata?.orgId;
-      if (orgId) {
-        const subId = `stripe_${obj.subscription || obj.id}`;
-        const unix = (obj.current_period_end || obj.period_end || Math.floor(Date.now() / 1000));
-        await prisma.subscription.upsert({
-          where: { id: subId },
-          update: { status: "active", currentPeriodEnd: new Date(unix * 1000) },
-          create: { id: subId, orgId, provider: "stripe", status: "active", currentPeriodEnd: new Date(unix * 1000) }
-        });
-      }
-    }
-
-    if (event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
-      const sub = event.data.object;
-      await prisma.subscription.updateMany({
-        where: { id: `stripe_${sub.id}` },
-        data: { status: sub.status, currentPeriodEnd: new Date(sub.current_period_end * 1000) }
-      });
-    }
-
-    res.json({ received: true });
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (e) {
-    console.error("stripe webhook error:", e?.message || e);
-    res.status(400).send("Webhook Error");
+    console.error("stripe webhook error (verify):", e?.message || e);
+    return res.status(400).send("Webhook Error");
+  }
+
+  try {
+    // Helpers
+    const upsertActive = async ({ subId, orgId, periodEndSec }) => {
+      if (!orgId || !subId || !periodEndSec) return;
+      const when = new Date(periodEndSec * 1000); // seconds -> ms
+      await prisma.subscription.upsert({
+        where: { id: subId },
+        update: { status: "active", currentPeriodEnd: when },
+        create: { id: subId, orgId, provider: "stripe", status: "active", currentPeriodEnd: when }
+      });
+    };
+
+    switch (event.type) {
+      case "checkout.session.completed": {
+        // session: https://stripe.com/docs/api/checkout/sessions/object
+        const session = event.data.object;
+        const orgId = session.metadata?.orgId || null;
+        const subIdRaw = session.subscription; // e.g. "sub_..."
+        if (orgId && subIdRaw) {
+          // fetch subscription to get period end
+          const sub = await stripe.subscriptions.retrieve(subIdRaw);
+          await upsertActive({
+            subId: `stripe_${sub.id}`,
+            orgId,
+            periodEndSec: sub.current_period_end
+          });
+        }
+        break;
+      }
+
+      case "invoice.payment_succeeded": {
+        // invoice: https://stripe.com/docs/api/invoices/object
+        const invoice = event.data.object;
+        const orgId = invoice.metadata?.orgId || invoice.customer; // prefer your metadata orgId; fall back to customer if you want
+        const subIdRaw = invoice.subscription; // e.g. "sub_..."
+        // safest: read period end from the first line's period
+        const line = invoice.lines?.data?.[0];
+        const periodEndSec =
+          line?.period?.end ||
+          null;
+
+        if (orgId && subIdRaw && periodEndSec) {
+          await upsertActive({
+            subId: `stripe_${subIdRaw}`,
+            orgId,
+            periodEndSec
+          });
+        }
+        break;
+      }
+
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
+        // subscription: https://stripe.com/docs/api/subscriptions/object
+        const sub = event.data.object;
+        const periodEndSec = sub.current_period_end || Math.floor(Date.now() / 1000);
+        await prisma.subscription.updateMany({
+          where: { id: `stripe_${sub.id}` },
+          data: {
+            status: sub.status, // "active" | "past_due" | "canceled" | ...
+            currentPeriodEnd: new Date(periodEndSec * 1000)
+          }
+        });
+        break;
+      }
+
+      default:
+        // ignore others
+        break;
+    }
+
+    // 200 quickly so Stripe doesn’t retry
+    return res.json({ received: true });
+  } catch (e) {
+    console.error("stripe webhook error (handler):", e?.message || e);
+    return res.status(400).send("Webhook Error");
   }
 });
 
