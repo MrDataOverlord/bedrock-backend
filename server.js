@@ -16,14 +16,14 @@ const app = express();
 // ---------- helpers ----------
 const getToken = (req) =>
   String(req.headers.authorization || "")
-    .replace(/^Bearer\s+/i, "") // case-insensitive, trims extra spaces
+    .replace(/^Bearer\s+/i, "")
     .trim();
 
 // ---------- proxy & security ----------
 app.set("trust proxy", 1);
 app.use(helmet());
 
-// ---------- Stripe webhook (raw body) ----------
+// ---------- Stripe webhook (raw body FIRST) ----------
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
 
 app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async (req, res) => {
@@ -37,10 +37,9 @@ app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async
   }
 
   try {
-    // Helpers
     const upsertActive = async ({ subId, orgId, periodEndSec }) => {
       if (!orgId || !subId || !periodEndSec) return;
-      const when = new Date(periodEndSec * 1000); // seconds -> ms
+      const when = new Date(periodEndSec * 1000);
       await prisma.subscription.upsert({
         where: { id: subId },
         update: { status: "active", currentPeriodEnd: when },
@@ -50,12 +49,10 @@ app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async
 
     switch (event.type) {
       case "checkout.session.completed": {
-        // session: https://stripe.com/docs/api/checkout/sessions/object
         const session = event.data.object;
         const orgId = session.metadata?.orgId || null;
-        const subIdRaw = session.subscription; // e.g. "sub_..."
+        const subIdRaw = session.subscription;
         if (orgId && subIdRaw) {
-          // fetch subscription to get period end
           const sub = await stripe.subscriptions.retrieve(subIdRaw);
           await upsertActive({
             subId: `stripe_${sub.id}`,
@@ -67,15 +64,11 @@ app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async
       }
 
       case "invoice.payment_succeeded": {
-        // invoice: https://stripe.com/docs/api/invoices/object
         const invoice = event.data.object;
-        const orgId = invoice.metadata?.orgId || invoice.customer; // prefer your metadata orgId; fall back to customer if you want
-        const subIdRaw = invoice.subscription; // e.g. "sub_..."
-        // safest: read period end from the first line's period
+        const orgId = invoice.metadata?.orgId || invoice.customer;
+        const subIdRaw = invoice.subscription;
         const line = invoice.lines?.data?.[0];
-        const periodEndSec =
-          line?.period?.end ||
-          null;
+        const periodEndSec = line?.period?.end || null;
 
         if (orgId && subIdRaw && periodEndSec) {
           await upsertActive({
@@ -89,13 +82,12 @@ app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async
 
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
-        // subscription: https://stripe.com/docs/api/subscriptions/object
         const sub = event.data.object;
         const periodEndSec = sub.current_period_end || Math.floor(Date.now() / 1000);
         await prisma.subscription.updateMany({
           where: { id: `stripe_${sub.id}` },
           data: {
-            status: sub.status, // "active" | "past_due" | "canceled" | ...
+            status: sub.status,
             currentPeriodEnd: new Date(periodEndSec * 1000)
           }
         });
@@ -103,11 +95,9 @@ app.post("/webhooks/stripe", bodyParser.raw({ type: "application/json" }), async
       }
 
       default:
-        // ignore others
         break;
     }
 
-    // 200 quickly so Stripe doesn’t retry
     return res.json({ received: true });
   } catch (e) {
     console.error("stripe webhook error (handler):", e?.message || e);
@@ -253,9 +243,10 @@ app.post("/billing/force-active", async (req, res) => {
   }
 });
 
+// ---------- Stripe Checkout (subscription) ----------
 app.post("/billing/checkout", async (req, res) => {
   try {
-    const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    const token = getToken(req);
     const { orgId } = verifyJwt(token);
 
     const price = process.env.STRIPE_PRICE_PREMIUM;
@@ -280,8 +271,6 @@ app.post("/billing/checkout", async (req, res) => {
     res.status(400).json({ error: "checkout failed", detail: e.message || String(e) });
   }
 });
-
-
 
 // ---------- entitlements (premium-aware) ----------
 app.get("/entitlements", async (req, res) => {
