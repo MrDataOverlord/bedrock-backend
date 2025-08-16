@@ -72,9 +72,6 @@ app.post(
       const sig = req.headers["stripe-signature"];
       const event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
 
-      // Helpful in logs:
-      // console.log("stripe event:", event.type);
-
       // 1) Checkout completed → activate/record subscription
       if (event.type === "checkout.session.completed") {
         const session = event.data.object;
@@ -125,7 +122,7 @@ app.post(
             update: pickDefined({ status: "active", currentPeriodEnd: end }),
             create: pickDefined({
               id: `stripe_${subId}`,
-              orgId: inv?.metadata?.orgId || "", // if you also propagate metadata through invoices
+              orgId: inv?.metadata?.orgId || "",
               provider: "stripe",
               status: "active",
               currentPeriodEnd: end,
