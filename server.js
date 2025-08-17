@@ -42,6 +42,31 @@ function pickDefined(obj) {
   return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 }
 
+app.post(
+  "/webhooks/stripe",
+  bodyParser.raw({ type: "*/*" }),   // ⟵ catch any json content-type
+  async (req, res) => {
+    try {
+      const sig = req.headers["stripe-signature"];
+      if (!sig) throw new Error("Missing Stripe-Signature header");
+      // req.body MUST be a Buffer
+      if (!Buffer.isBuffer(req.body)) throw new Error("Webhook body is not a Buffer");
+
+      const event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        STRIPE_WEBHOOK_SECRET
+      );
+
+      // … (rest of your event handling stays the same)
+      res.json({ received: true });
+    } catch (e) {
+      console.error("stripe webhook error (verify):", e?.message || e);
+      res.status(400).send("Webhook Error");
+    }
+  }
+);
+
 // ---------- app ----------
 const app = express();
 app.set("trust proxy", 1); // avoids express-rate-limit proxy warning on Render
