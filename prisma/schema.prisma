@@ -10,20 +10,20 @@ datasource db {
 // Core
 
 model Device {
-  id         String   @id @default(cuid())
-  deviceId   String
-  platform   String
-  pushToken  String?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  id        String   @id @default(cuid())
+  deviceId  String
+  platform  String
+  pushToken String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model User {
-  id             String           @id @default(cuid())
-  email          String           @unique
-  passwordHash   String?
-  totpSecret     String?
-  createdAt      DateTime         @default(now())
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String?
+  totpSecret   String?
+  createdAt    DateTime @default(now())
 
   ownedOrgs      Org[]
   memberships    Member[]
@@ -36,7 +36,7 @@ model Org {
   name        String   @default("My Org")
   createdAt   DateTime @default(now())
 
-  owner         User   @relation(fields: [ownerUserId], references: [id])
+  owner         User           @relation(fields: [ownerUserId], references: [id])
   members       Member[]
   subscriptions Subscription[]
 
@@ -61,30 +61,30 @@ model Member {
 // Password / Registration
 
 model PasswordToken {
-  id         String   @id @default(cuid())
-  userId     String
-  purpose    String
-  tokenHash  String   @unique
-  expiresAt  DateTime
-  usedAt     DateTime?
-  createdAt  DateTime @default(now())
+  id        String    @id @default(cuid())
+  userId    String
+  purpose   String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id])
 
-  @@index([userId])        // ✅ model-level index
+  @@index([userId]) // ✅ model-level index
 }
 
 // Billing
 
 model Subscription {
-  id               String   @id       // store "stripe_<subId>"
+  id               String    @id // store "stripe_<subId>"
   orgId            String
   provider         String
   status           String
   currentPeriodEnd DateTime?
   customerId       String?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
 
   org Org @relation(fields: [orgId], references: [id])
 
