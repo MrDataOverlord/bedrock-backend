@@ -44,7 +44,7 @@ model Member {
 
 model PasswordToken {
   id         String   @id @default(cuid())
-  userId     String   @index
+  userId     String
   purpose    String   // "register" | "reset"
   tokenHash  String   @unique
   expiresAt  DateTime
@@ -52,6 +52,8 @@ model PasswordToken {
   createdAt  DateTime @default(now())
 
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])   // ✅ model-level index
 }
 
 model Subscription {
