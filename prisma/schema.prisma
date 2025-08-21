@@ -42,6 +42,18 @@ model Member {
   createdAt DateTime @default(now())
 }
 
+model PasswordToken {
+  id         String   @id @default(cuid())
+  userId     String   @index
+  purpose    String   // "register" | "reset"
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  createdAt  DateTime @default(now())
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
 model Subscription {
   id               String   @id
   orgId            String
