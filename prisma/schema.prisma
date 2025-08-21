@@ -71,7 +71,7 @@ model PasswordToken {
 
   user User @relation(fields: [userId], references: [id])
 
-  @@index([userId])
+  @@index([userId])        // ✅ model-level index
 }
 
 // Billing
