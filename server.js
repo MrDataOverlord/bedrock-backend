@@ -1,4 +1,3 @@
-// server.js
 import express from "express";
 import helmet from "helmet";
 import cors from "cors";
@@ -8,6 +7,8 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import Stripe from "stripe";
 import { PrismaClient } from "@prisma/client";
+import crypto from "crypto";
+import nodemailer from "nodemailer";
 
 const prisma = new PrismaClient();
 
@@ -18,12 +19,25 @@ const {
   PORT = 10000,
   CORS_ORIGINS = "",
   JWT_SECRET = "dev_jwt_secret_change_me",
-  APP_DOMAIN = "", // e.g. https://bedrock-backend-xxxxx.onrender.com
+  APP_DOMAIN = "",
+
   STRIPE_SECRET_KEY = "",
   STRIPE_PRICE_PREMIUM = "",
   STRIPE_WEBHOOK_SECRET = "",
-  SUCCESS_URL, // optional override
-  CANCEL_URL,  // optional override
+
+  // Optional overrides for Stripe return URLs
+  SUCCESS_URL,
+  CANCEL_URL,
+
+  // Email + links for password flows
+  MAIL_FROM = "NerdHerd Utilities <no-reply@nerdherdutilities.com>",
+  REG_URL_BASE = "https://www.nerdherdutilities.com/account",
+  RESET_URL_BASE = "https://www.nerdherdutilities.com/account",
+  RESEND_API_KEY = "",
+  SMTP_HOST = "",
+  SMTP_PORT = "",
+  SMTP_USER = "",
+  SMTP_PASS = "",
 } = process.env;
 
 const stripe = new Stripe(STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
@@ -31,7 +45,7 @@ const stripe = new Stripe(STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" })
 /* =========================
    Helpers
 ========================= */
-const signJwt  = (payload, expiresIn = "72h") => jwt.sign(payload, JWT_SECRET, { expiresIn });
+const signJwt  = (payload, expiresIn = "24h") => jwt.sign(payload, JWT_SECRET, { expiresIn });
 const verifyJwt = (token) => jwt.verify(token, JWT_SECRET);
 
 const unixToDate = (unix) => {
@@ -41,37 +55,77 @@ const unixToDate = (unix) => {
 };
 const defined = (obj) => Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 
-/** Persist one subscription snapshot into DB */
-async function writeSubFromStripe(sub, orgIdMaybe) {
-  // prefer orgId from subscription metadata; fall back to provided orgId
-  const orgId = sub?.metadata?.orgId || orgIdMaybe;
-  const end = unixToDate(sub?.current_period_end);
-  if (!orgId) {
-    // If orgId is missing, try to keep status only (row may already exist with orgId)
-    await prisma.subscription.upsert({
-      where: { id: `stripe_${sub.id}` },
-      update: defined({ status: sub.status, currentPeriodEnd: end }),
-      create: defined({
-        id: `stripe_${sub.id}`,
-        orgId: "", // unknown; will be backfilled when known
-        provider: "stripe",
-        status: sub.status,
-        currentPeriodEnd: end,
-      }),
+/** Email */
+async function sendEmail({ to, subject, html }) {
+  if (RESEND_API_KEY) {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: MAIL_FROM, to: [to], subject, html }),
     });
+    if (!res.ok) throw new Error(`Resend: ${await res.text()}`);
     return;
   }
+  if (SMTP_HOST) {
+    const transporter = nodemailer.createTransport({
+      host: SMTP_HOST, port: Number(SMTP_PORT || 587), secure: Number(SMTP_PORT) === 465,
+      auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
+    });
+    await transporter.sendMail({ from: MAIL_FROM, to, subject, html });
+    return;
+  }
+  console.log("[DEV EMAIL]", { to, subject, html });
+}
+
+const makeRawToken = () => crypto.randomBytes(32).toString("base64url");
+const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
+
+async function issuePasswordToken(userId, purpose) {
+  const raw = makeRawToken();
+  const tokenHash = sha256(raw);
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+  await prisma.passwordToken.create({ data: { userId, purpose, tokenHash, expiresAt } });
+  return raw;
+}
+
+async function sendRegistrationEmail(email, userId) {
+  const raw = await issuePasswordToken(userId, "register");
+  const url = `${REG_URL_BASE.replace(/\/$/, "")}/set-password?token=${encodeURIComponent(raw)}`;
+  await sendEmail({
+    to: email,
+    subject: "Complete your NerdHerd Utilities account",
+    html: `
+      <p>Thanks for your purchase! Create your password to finish your account:</p>
+      <p><a href="${url}">Set your password</a></p>
+      <p>This link expires in 24 hours.</p>
+    `,
+  });
+}
+
+async function sendResetEmail(email, userId) {
+  const raw = await issuePasswordToken(userId, "reset");
+  const url = `${RESET_URL_BASE.replace(/\/$/, "")}/reset-password?token=${encodeURIComponent(raw)}`;
+  await sendEmail({
+    to: email,
+    subject: "Reset your NerdHerd Utilities password",
+    html: `
+      <p>Reset your password using the link below:</p>
+      <p><a href="${url}">Reset password</a></p>
+      <p>This link expires in 24 hours.</p>
+    `,
+  });
+}
+
+/** Persist one subscription snapshot into DB */
+async function writeSubFromStripe(sub, orgIdMaybe) {
+  const orgId = sub?.metadata?.orgId || orgIdMaybe;
+  const end = unixToDate(sub?.current_period_end);
+  const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
 
   await prisma.subscription.upsert({
     where: { id: `stripe_${sub.id}` },
-    update: defined({ orgId, provider: "stripe", status: sub.status, currentPeriodEnd: end }),
-    create: defined({
-      id: `stripe_${sub.id}`,
-      orgId,
-      provider: "stripe",
-      status: sub.status,
-      currentPeriodEnd: end,
-    }),
+    update: defined({ orgId, provider: "stripe", status: sub.status, currentPeriodEnd: end, customerId }),
+    create: defined({ id: `stripe_${sub.id}`, orgId, provider: "stripe", status: sub.status, currentPeriodEnd: end, customerId }),
   });
 }
 
@@ -87,7 +141,7 @@ const ALLOWED = CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
 app.use(
   cors({
     origin(origin, cb) {
-      if (!origin || ALLOWED.length === 0 || ALLOWED.includes(origin)) return cb(null, true);
+      if (!origin || ALLOWED.length === 0 || ALLOWED.includes(origin) || origin === "null") return cb(null, true);
       cb(new Error("Not allowed by CORS"));
     },
   })
@@ -97,7 +151,7 @@ app.use(
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
 /* =========================================================
-   STRIPE WEBHOOK — must come BEFORE express.json middleware
+   STRIPE WEBHOOK — must be BEFORE express.json
 ========================================================= */
 app.post(
   "/webhooks/stripe",
@@ -108,57 +162,76 @@ app.post(
       const sig = req.headers["stripe-signature"];
       event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
     } catch (err) {
-      console.error("stripe webhook error (verify):", err?.message || err);
+      console.error("stripe webhook verify error:", err?.message || err);
       return res.status(400).send("Webhook Error");
     }
 
     try {
-      // Helpful breadcrumb in logs
-      console.log("stripe webhook:", event.type);
-
       switch (event.type) {
-        /** User just completed checkout */
         case "checkout.session.completed": {
           const session = event.data.object;
-          const orgId = session?.metadata?.orgId;
           const subId = session?.subscription;
+          let orgId = session?.metadata?.orgId || null;
+
+          // pull purchaser email
+          let purchaserEmail = session?.customer_details?.email || session?.customer_email || null;
+          if (!purchaserEmail && session?.customer) {
+            try {
+              const cust = await stripe.customers.retrieve(session.customer);
+              purchaserEmail = typeof cust.email === "string" ? cust.email : null;
+            } catch {}
+          }
+
+          // if no orgId (public checkout), create user/org and email registration link
+          if (!orgId && purchaserEmail) {
+            let user = await prisma.user.findUnique({ where: { email: purchaserEmail } });
+            if (!user) {
+              user = await prisma.user.create({ data: { email: purchaserEmail } }); // passwordHash null for now
+              const org = await prisma.org.create({ data: { ownerUserId: user.id, name: "My Org" } });
+              await prisma.member.create({ data: { orgId: org.id, userId: user.id, role: "owner" } });
+              orgId = org.id;
+              try { await sendRegistrationEmail(purchaserEmail, user.id); } catch (e) { console.warn("registration email fail:", e?.message || e); }
+            } else {
+              const membership = await prisma.member.findFirst({ where: { userId: user.id } });
+              if (!membership) {
+                const org = await prisma.org.create({ data: { ownerUserId: user.id, name: "My Org" } });
+                await prisma.member.create({ data: { orgId: org.id, userId: user.id, role: "owner" } });
+                orgId = org.id;
+              } else {
+                orgId = membership.orgId;
+              }
+              const hasPassword = !!(await prisma.user.findUnique({ where: { email: purchaserEmail }, select: { passwordHash: true } }))?.passwordHash;
+              if (!hasPassword) { try { await sendRegistrationEmail(purchaserEmail, user.id); } catch {} }
+            }
+          }
 
           if (subId) {
-            // Ensure the subscription permanently carries orgId in its metadata
-            try {
-              await stripe.subscriptions.update(subId, { metadata: { orgId } });
-            } catch (e) {
-              // ignore; might already be set or not allowed in some states
-              console.warn("sub metadata update skipped:", e?.message || e);
-            }
-
+            try { await stripe.subscriptions.update(subId, { metadata: { orgId } }); } catch {}
             const sub = await stripe.subscriptions.retrieve(subId);
             await writeSubFromStripe(sub, orgId);
           }
+
           break;
         }
 
-        /** Recurring invoice succeeded (period extended) */
         case "invoice.payment_succeeded": {
           const inv = event.data.object;
           const subId = inv?.subscription;
           if (subId) {
             const sub = await stripe.subscriptions.retrieve(subId);
-            await writeSubFromStripe(sub /* orgId from metadata */);
+            await writeSubFromStripe(sub);
           }
           break;
         }
 
-        /** Any subscription state change (trialing->active, canceled, etc.) */
         case "customer.subscription.updated":
         case "customer.subscription.deleted": {
           const sub = event.data.object;
-          await writeSubFromStripe(sub /* orgId from metadata */);
+          await writeSubFromStripe(sub);
           break;
         }
 
         default:
-          // No-op for other events
           break;
       }
 
@@ -171,7 +244,7 @@ app.post(
 );
 
 /* =========================================================
-   All other routes use JSON body — after the webhook
+   All other routes use JSON body
 ========================================================= */
 app.use(express.json({ limit: "256kb" }));
 
@@ -186,15 +259,15 @@ app.get("/", (_req, res) => {
 Status: /healthz
 
 Auth:
-• POST /auth/signup {"email","password"}
 • POST /auth/login  {"email","password"}
+• POST /auth/request-reset {"email"}
+• POST /auth/set-password {"token","password"}
 
 Billing:
-• POST /billing/checkout    (Bearer token) → returns Stripe URL
-• POST /billing/force-active (test/dev; Bearer token) → mark premium
-• GET  /billing/status       (Bearer token) → debug view
-• GET  /billing/success
-• POST /webhooks/stripe     (Stripe)
+• POST /billing/checkout            (Bearer token) → Stripe URL
+• POST /billing/checkout_public     {"email"}     → Stripe URL (no login)
+• POST /billing/portal              (Bearer token) → Stripe Billing Portal
+• POST /webhooks/stripe
 
 Entitlements:
 • GET  /entitlements  (Bearer token)
@@ -203,36 +276,72 @@ Entitlements:
 });
 
 /* =========================
-   Auth (minimal)
+   Auth (signup disabled — use email link after payment)
 ========================= */
-app.post("/auth/signup", async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: "Missing fields" });
-
-  const hash = await bcrypt.hash(password, 10);
-
-  // create user + org
-  const user = await prisma.user.create({ data: { email, passwordHash: hash } });
-  const org = await prisma.org.create({ data: { ownerUserId: user.id, name: "My Org" } });
-  await prisma.member.create({ data: { orgId: org.id, userId: user.id, role: "owner" } });
-
-  const token = signJwt({ uid: user.id, orgId: org.id });
-  res.json({ ok: true, token });
+// DISABLE direct signup to enforce “pay first”
+app.post("/auth/signup", (_req, res) => {
+  res.status(403).json({ error: "signup_disabled", message: "Create your account from the email link after payment." });
 });
 
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body || {};
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) return res.status(401).json({ error: "Invalid credentials" });
+  if (!email || !password) return res.status(400).json({ error: "Missing fields" });
 
-  const ok = await bcrypt.compare(password, user.passwordHash || "");
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user?.passwordHash) return res.status(401).json({ error: "Invalid credentials" });
+
+  const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
+  // Find user's org
   const member = await prisma.member.findFirst({ where: { userId: user.id } });
   const orgId = member?.orgId;
+  if (!orgId) return res.status(403).json({ error: "no_org" });
+
+  // Enforce ACTIVE & not expired
+  const now = new Date();
+  const sub = await prisma.subscription.findFirst({ where: { orgId }, orderBy: { updatedAt: "desc" } });
+  const active = !!(sub && sub.status === "active" && sub.currentPeriodEnd && sub.currentPeriodEnd > now);
+  if (!active) return res.status(402).json({ error: "inactive_subscription" });
 
   const token = signJwt({ uid: user.id, orgId });
   res.json({ ok: true, access: token });
+});
+
+// Forgot password (doesn't reveal existence)
+app.post("/auth/request-reset", async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: "missing_email" });
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (user) { try { await sendResetEmail(email, user.id); } catch (e) { console.warn("reset email:", e?.message || e); } }
+  res.json({ ok: true });
+});
+
+// Set/Reset password with single-use token
+app.post("/auth/set-password", async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: "missing_fields" });
+
+  const tokenHash = sha256(token);
+  const t = await prisma.passwordToken.findUnique({ where: { tokenHash } }).catch(() => null);
+  if (!t || t.usedAt || new Date(t.expiresAt).getTime() < Date.now()) {
+    return res.status(400).json({ error: "invalid_or_expired_token" });
+  }
+  if (t.purpose !== "register" && t.purpose !== "reset") {
+    return res.status(400).json({ error: "invalid_token_purpose" });
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+
+  await prisma.$transaction([
+    prisma.user.update({ where: { id: t.userId }, data: { passwordHash: hash } }),
+    prisma.passwordToken.update({ where: { tokenHash }, data: { usedAt: new Date() } }),
+  ]);
+
+  // Optional: return an access token (still requires ACTIVE sub to be useful)
+  const m = await prisma.member.findFirst({ where: { userId: t.userId } });
+  const access = signJwt({ uid: t.userId, orgId: m?.orgId });
+  res.json({ ok: true, access });
 });
 
 /* =========================
@@ -242,7 +351,7 @@ app.get("/billing/success", (_req, res) =>
   res.type("html").send(`<h2>Payment success</h2><p>You can close this tab.</p>`)
 );
 
-// Create a checkout session
+// Logged-in checkout (kept for in-app flow if you want it)
 app.post("/billing/checkout", async (req, res) => {
   try {
     const auth = req.headers.authorization || "";
@@ -257,11 +366,8 @@ app.post("/billing/checkout", async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      // put orgId on the SUBSCRIPTION so all future events carry it
+      success_url: successUrl, cancel_url: cancelUrl,
       subscription_data: { metadata: { orgId } },
-      // keep also on session for immediate use in the webhook
       metadata: { orgId },
     });
 
@@ -272,44 +378,73 @@ app.post("/billing/checkout", async (req, res) => {
   }
 });
 
-// Dev helper — mark premium active manually
-app.post("/billing/force-active", async (req, res) => {
+// Public checkout (email only) — creates org if needed, then Stripe
+app.post("/billing/checkout_public", async (req, res) => {
   try {
-    const auth = req.headers.authorization || "";
-    const token = auth.replace("Bearer ", "");
-    const payload = verifyJwt(token);
-    await prisma.subscription.upsert({
-      where: { id: `manual_${payload.orgId}` },
-      update: { status: "active" },
-      create: { id: `manual_${payload.orgId}`, orgId: payload.orgId, provider: "manual", status: "active" },
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: "missing_email" });
+
+    // Ensure user/org
+    let user = await prisma.user.findUnique({ where: { email } });
+    let orgId;
+    if (!user) {
+      user = await prisma.user.create({ data: { email } });
+      const org = await prisma.org.create({ data: { ownerUserId: user.id, name: "My Org" } });
+      await prisma.member.create({ data: { orgId: org.id, userId: user.id, role: "owner" } });
+      orgId = org.id;
+    } else {
+      const m = await prisma.member.findFirst({ where: { userId: user.id } });
+      if (m) orgId = m.orgId;
+      else {
+        const org = await prisma.org.create({ data: { ownerUserId: user.id, name: "My Org" } });
+        await prisma.member.create({ data: { orgId: org.id, userId: user.id, role: "owner" } });
+        orgId = org.id;
+      }
+    }
+
+    const successUrl = SUCCESS_URL || `${APP_DOMAIN}/billing/success`;
+    const cancelUrl  = CANCEL_URL  || `${APP_DOMAIN}/billing/success`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      success_url: successUrl, cancel_url: cancelUrl,
+      customer_email: email,
+      subscription_data: { metadata: { orgId } },
+      metadata: { orgId },
     });
-    res.json({ ok: true });
-  } catch {
-    res.status(401).json({ error: "invalid token" });
+
+    // Pre-issue registration email (webhook will also ensure it lands)
+    try { await sendRegistrationEmail(email, user.id); } catch {}
+
+    res.json({ ok: true, url: session.url });
+  } catch (e) {
+    console.error("checkout_public error", e?.message || e);
+    res.status(400).json({ error: "checkout_public_failed" });
   }
 });
 
-// Debug helper — see what the server thinks your latest sub is
-app.get("/billing/status", async (req, res) => {
+// Billing portal (optional, if you added customerId column)
+app.post("/billing/portal", async (req, res) => {
   try {
     const auth = req.headers.authorization || "";
     const token = auth.replace("Bearer ", "");
     const { orgId } = verifyJwt(token);
-    const sub = await prisma.subscription.findFirst({
-      where: { orgId },
-      orderBy: { updatedAt: "desc" },
+    const sub = await prisma.subscription.findFirst({ where: { orgId, provider: "stripe" }, orderBy: { updatedAt: "desc" } });
+    if (!sub?.customerId) return res.status(404).json({ error: "no_customer" });
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: sub.customerId,
+      return_url: SUCCESS_URL || `${APP_DOMAIN}/billing/success`
     });
-    res.json({ ok: true, subscription: sub });
+    res.json({ ok: true, url: portal.url });
   } catch {
-    res.status(401).json({ error: "invalid token" });
+    res.status(401).json({ error: "unauthorized" });
   }
 });
 
 /* =========================
-   Entitlements
+   Entitlements (ACTIVE only)
 ========================= */
-const PREMIUM_STATES = new Set(["active", "trialing"]);
-
 app.get("/entitlements", async (req, res) => {
   try {
     const auth = req.headers.authorization || "";
@@ -322,17 +457,23 @@ app.get("/entitlements", async (req, res) => {
       take: 3,
     });
 
-    const latest = subs.find((s) => PREMIUM_STATES.has(s.status));
-    const isPremium = Boolean(latest);
+    const now = new Date();
+    const s = subs.find((x) => x.status === "active" && x.currentPeriodEnd && x.currentPeriodEnd > now);
+
+    const isPremium = !!s;
+    const periodEnd = s?.currentPeriodEnd ?? null;
+    const daysRemaining = periodEnd ? Math.max(0, Math.ceil((periodEnd.getTime() - Date.now()) / 86400000)) : 0;
 
     const entitlement = {
       uid: payload.uid,
       orgId: payload.orgId,
       features: isPremium ? ["premium"] : ["basic"],
-      expiry: Date.now() + 72 * 60 * 60 * 1000,
+      periodEnd: periodEnd ? periodEnd.getTime() : null, // epoch ms
+      daysRemaining,
+      issuedAt: Date.now(),
     };
 
-    const signed = signJwt({ ent: entitlement }, "72h");
+    const signed = signJwt({ ent: entitlement }, "24h");
     res.json({ ok: true, entitlement: signed });
   } catch {
     res.status(401).json({ error: "invalid token" });
