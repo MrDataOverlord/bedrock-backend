@@ -1,3 +1,4 @@
+// server.js
 import express from "express";
 import helmet from "helmet";
 import cors from "cors";
@@ -8,7 +9,6 @@ import jwt from "jsonwebtoken";
 import Stripe from "stripe";
 import { PrismaClient } from "@prisma/client";
 import crypto from "crypto";
-import nodemailer from "nodemailer";
 
 const prisma = new PrismaClient();
 
@@ -19,25 +19,20 @@ const {
   PORT = 10000,
   CORS_ORIGINS = "",
   JWT_SECRET = "dev_jwt_secret_change_me",
-  APP_DOMAIN = "",
+  APP_DOMAIN = "", // e.g. https://bedrock-backend-xxxxx.onrender.com
 
   STRIPE_SECRET_KEY = "",
   STRIPE_PRICE_PREMIUM = "",
   STRIPE_WEBHOOK_SECRET = "",
 
-  // Optional overrides for Stripe return URLs
-  SUCCESS_URL,
-  CANCEL_URL,
+  SUCCESS_URL, // optional override
+  CANCEL_URL,  // optional override
 
-  // Email + links for password flows
+  // Email (Resend) + password link bases
   MAIL_FROM = "NerdHerd Utilities <no-reply@nerdherdutilities.com>",
+  RESEND_API_KEY = "", // if blank, emails are logged to console for dev
   REG_URL_BASE = "https://www.nerdherdutilities.com/account",
   RESET_URL_BASE = "https://www.nerdherdutilities.com/account",
-  RESEND_API_KEY = "",
-  SMTP_HOST = "",
-  SMTP_PORT = "",
-  SMTP_USER = "",
-  SMTP_PASS = "",
 } = process.env;
 
 const stripe = new Stripe(STRIPE_SECRET_KEY || "", { apiVersion: "2024-06-20" });
@@ -55,26 +50,17 @@ const unixToDate = (unix) => {
 };
 const defined = (obj) => Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 
-/** Email */
 async function sendEmail({ to, subject, html }) {
   if (RESEND_API_KEY) {
-    const res = await fetch("https://api.resend.com/emails", {
+    const r = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { "Authorization": `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ from: MAIL_FROM, to: [to], subject, html }),
+      body: JSON.stringify({ from: MAIL_FROM, to: [to], subject, html })
     });
-    if (!res.ok) throw new Error(`Resend: ${await res.text()}`);
+    if (!r.ok) throw new Error(`Resend error: ${await r.text()}`);
     return;
   }
-  if (SMTP_HOST) {
-    const transporter = nodemailer.createTransport({
-      host: SMTP_HOST, port: Number(SMTP_PORT || 587), secure: Number(SMTP_PORT) === 465,
-      auth: SMTP_USER ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-    });
-    await transporter.sendMail({ from: MAIL_FROM, to, subject, html });
-    return;
-  }
-  console.log("[DEV EMAIL]", { to, subject, html });
+  console.log("[DEV EMAIL]", { to, subject, html }); // dev fallback
 }
 
 const makeRawToken = () => crypto.randomBytes(32).toString("base64url");
@@ -94,11 +80,7 @@ async function sendRegistrationEmail(email, userId) {
   await sendEmail({
     to: email,
     subject: "Complete your NerdHerd Utilities account",
-    html: `
-      <p>Thanks for your purchase! Create your password to finish your account:</p>
-      <p><a href="${url}">Set your password</a></p>
-      <p>This link expires in 24 hours.</p>
-    `,
+    html: `<p>Thanks for your purchase! Create your password:</p><p><a href="${url}">Set your password</a></p><p>This link expires in 24 hours.</p>`
   });
 }
 
@@ -108,11 +90,7 @@ async function sendResetEmail(email, userId) {
   await sendEmail({
     to: email,
     subject: "Reset your NerdHerd Utilities password",
-    html: `
-      <p>Reset your password using the link below:</p>
-      <p><a href="${url}">Reset password</a></p>
-      <p>This link expires in 24 hours.</p>
-    `,
+    html: `<p>Reset with the link below:</p><p><a href="${url}">Reset password</a></p><p>This link expires in 24 hours.</p>`
   });
 }
 
@@ -141,7 +119,7 @@ const ALLOWED = CORS_ORIGINS.split(",").map((s) => s.trim()).filter(Boolean);
 app.use(
   cors({
     origin(origin, cb) {
-      if (!origin || ALLOWED.length === 0 || ALLOWED.includes(origin) || origin === "null") return cb(null, true);
+      if (!origin || ALLOWED.length === 0 || ALLOWED.includes(origin)) return cb(null, true);
       cb(new Error("Not allowed by CORS"));
     },
   })
@@ -151,7 +129,7 @@ app.use(
 app.use(rateLimit({ windowMs: 60_000, max: 60 }));
 
 /* =========================================================
-   STRIPE WEBHOOK — must be BEFORE express.json
+   STRIPE WEBHOOK — must come BEFORE express.json middleware
 ========================================================= */
 app.post(
   "/webhooks/stripe",
@@ -162,7 +140,7 @@ app.post(
       const sig = req.headers["stripe-signature"];
       event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
     } catch (err) {
-      console.error("stripe webhook verify error:", err?.message || err);
+      console.error("stripe webhook error (verify):", err?.message || err);
       return res.status(400).send("Webhook Error");
     }
 
@@ -173,7 +151,7 @@ app.post(
           const subId = session?.subscription;
           let orgId = session?.metadata?.orgId || null;
 
-          // pull purchaser email
+          // Extract purchaser email for “public” checkout
           let purchaserEmail = session?.customer_details?.email || session?.customer_email || null;
           if (!purchaserEmail && session?.customer) {
             try {
@@ -182,7 +160,7 @@ app.post(
             } catch {}
           }
 
-          // if no orgId (public checkout), create user/org and email registration link
+          // If no orgId (public checkout), create user/org and email registration link
           if (!orgId && purchaserEmail) {
             let user = await prisma.user.findUnique({ where: { email: purchaserEmail } });
             if (!user) {
@@ -210,7 +188,6 @@ app.post(
             const sub = await stripe.subscriptions.retrieve(subId);
             await writeSubFromStripe(sub, orgId);
           }
-
           break;
         }
 
@@ -244,7 +221,7 @@ app.post(
 );
 
 /* =========================================================
-   All other routes use JSON body
+   All other routes use JSON body — after the webhook
 ========================================================= */
 app.use(express.json({ limit: "256kb" }));
 
@@ -266,7 +243,7 @@ Auth:
 Billing:
 • POST /billing/checkout            (Bearer token) → Stripe URL
 • POST /billing/checkout_public     {"email"}     → Stripe URL (no login)
-• POST /billing/portal              (Bearer token) → Stripe Billing Portal
+• GET  /billing/success
 • POST /webhooks/stripe
 
 Entitlements:
@@ -276,9 +253,8 @@ Entitlements:
 });
 
 /* =========================
-   Auth (signup disabled — use email link after payment)
+   Auth  (signup disabled: pay first, then set password via email)
 ========================= */
-// DISABLE direct signup to enforce “pay first”
 app.post("/auth/signup", (_req, res) => {
   res.status(403).json({ error: "signup_disabled", message: "Create your account from the email link after payment." });
 });
@@ -298,7 +274,7 @@ app.post("/auth/login", async (req, res) => {
   const orgId = member?.orgId;
   if (!orgId) return res.status(403).json({ error: "no_org" });
 
-  // Enforce ACTIVE & not expired
+  // Enforce ACTIVE & not expired (30-day windows via Stripe current_period_end)
   const now = new Date();
   const sub = await prisma.subscription.findFirst({ where: { orgId }, orderBy: { updatedAt: "desc" } });
   const active = !!(sub && sub.status === "active" && sub.currentPeriodEnd && sub.currentPeriodEnd > now);
@@ -308,7 +284,7 @@ app.post("/auth/login", async (req, res) => {
   res.json({ ok: true, access: token });
 });
 
-// Forgot password (doesn't reveal existence)
+// Forgot password (no user enumeration)
 app.post("/auth/request-reset", async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: "missing_email" });
@@ -351,7 +327,7 @@ app.get("/billing/success", (_req, res) =>
   res.type("html").send(`<h2>Payment success</h2><p>You can close this tab.</p>`)
 );
 
-// Logged-in checkout (kept for in-app flow if you want it)
+// Logged-in checkout
 app.post("/billing/checkout", async (req, res) => {
   try {
     const auth = req.headers.authorization || "";
@@ -378,7 +354,7 @@ app.post("/billing/checkout", async (req, res) => {
   }
 });
 
-// Public checkout (email only) — creates org if needed, then Stripe
+// Public checkout (email only)
 app.post("/billing/checkout_public", async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -414,7 +390,7 @@ app.post("/billing/checkout_public", async (req, res) => {
       metadata: { orgId },
     });
 
-    // Pre-issue registration email (webhook will also ensure it lands)
+    // Pre-issue registration email (webhook also handles it)
     try { await sendRegistrationEmail(email, user.id); } catch {}
 
     res.json({ ok: true, url: session.url });
@@ -424,26 +400,8 @@ app.post("/billing/checkout_public", async (req, res) => {
   }
 });
 
-// Billing portal (optional, if you added customerId column)
-app.post("/billing/portal", async (req, res) => {
-  try {
-    const auth = req.headers.authorization || "";
-    const token = auth.replace("Bearer ", "");
-    const { orgId } = verifyJwt(token);
-    const sub = await prisma.subscription.findFirst({ where: { orgId, provider: "stripe" }, orderBy: { updatedAt: "desc" } });
-    if (!sub?.customerId) return res.status(404).json({ error: "no_customer" });
-    const portal = await stripe.billingPortal.sessions.create({
-      customer: sub.customerId,
-      return_url: SUCCESS_URL || `${APP_DOMAIN}/billing/success`
-    });
-    res.json({ ok: true, url: portal.url });
-  } catch {
-    res.status(401).json({ error: "unauthorized" });
-  }
-});
-
 /* =========================
-   Entitlements (ACTIVE only)
+   Entitlements (ACTIVE only) + days remaining
 ========================= */
 app.get("/entitlements", async (req, res) => {
   try {
