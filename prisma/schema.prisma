@@ -1,37 +1,42 @@
+// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
-  // MUST match your Render env var name
   url      = env("DATABASE_URL")
 }
 
-model Device {
-  id        String   @id @default(cuid())
-  userId    String?
-  orgId     String?
-  platform  String
-  pushToken String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
+/* =========================================================
+   Core models
+========================================================= */
 
 model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  passwordHash String
-  totpSecret   String?
-  createdAt    DateTime @default(now())
+  id             String           @id @default(cuid())
+  email          String           @unique
+  passwordHash   String?
+  totpSecret     String?
+  createdAt      DateTime         @default(now())
+
+  // Relations
+  ownedOrgs      Org[]            @relation("OrgOwner")
+  memberships    Member[]
+  passwordTokens PasswordToken[]
 }
 
 model Org {
-  id          String   @id @default(cuid())
+  id          String         @id @default(cuid())
   ownerUserId String
-  name        String   @default("My Org")
-  createdAt   DateTime @default(now())
+  name        String         @default("My Org")
+  createdAt   DateTime       @default(now())
+
+  // Relations
+  owner         User         @relation("OrgOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  members       Member[]
   subscriptions Subscription[]
+
+  @@index([ownerUserId])
 }
 
 model Member {
@@ -40,7 +45,19 @@ model Member {
   userId    String
   role      String   @default("owner")
   createdAt DateTime @default(now())
+
+  // Relations
+  org  Org  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([orgId])
+  @@index([userId])
 }
+
+/* =========================================================
+   Password / registration flow
+========================================================= */
 
 model PasswordToken {
   id         String   @id @default(cuid())
@@ -51,20 +68,29 @@ model PasswordToken {
   usedAt     DateTime?
   createdAt  DateTime @default(now())
 
-  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId])   // ✅ model-level index
+  @@index([userId])
 }
 
+/* =========================================================
+   Billing
+========================================================= */
+
 model Subscription {
-  id               String   @id
+  id               String    @id            // we store "stripe_<subId>" as the primary key
   orgId            String
-  org              Org      @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  provider         String   @default("manual")      // or 'stripe'
-  status           String   @default("inactive")    // inactive|active|past_due|canceled
-  currentPeriodEnd DateTime?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  provider         String                      // "stripe"
+  status           String                      // "active" | "trialing" | ...
+  currentPeriodEnd DateTime?                   // used to compute days remaining
+  customerId       String?                     // Stripe customer id (for billing portal)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  // Relations
+  org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   @@index([orgId])
+  @@index([provider])
 }
