@@ -8,9 +8,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-/* =========================================================
-   Core models
-========================================================= */
+/* ---------- Core ---------- */
 
 model User {
   id             String           @id @default(cuid())
@@ -55,9 +53,7 @@ model Member {
   @@index([userId])
 }
 
-/* =========================================================
-   Password / registration flow
-========================================================= */
+/* ---------- Password / Registration ---------- */
 
 model PasswordToken {
   id         String   @id @default(cuid())
@@ -68,27 +64,23 @@ model PasswordToken {
   usedAt     DateTime?
   createdAt  DateTime @default(now())
 
-  // Relations
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
 }
 
-/* =========================================================
-   Billing
-========================================================= */
+/* ---------- Billing ---------- */
 
 model Subscription {
-  id               String    @id            // we store "stripe_<subId>" as the primary key
+  id               String    @id                // store "stripe_<subId>" here
   orgId            String
-  provider         String                      // "stripe"
-  status           String                      // "active" | "trialing" | ...
-  currentPeriodEnd DateTime?                   // used to compute days remaining
-  customerId       String?                     // Stripe customer id (for billing portal)
+  provider         String                          // "stripe"
+  status           String                          // "active" | "trialing" | etc.
+  currentPeriodEnd DateTime?
+  customerId       String?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
-  // Relations
   org Org @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
   @@index([orgId])
