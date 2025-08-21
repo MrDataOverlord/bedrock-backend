@@ -9,6 +9,15 @@ datasource db {
 
 // Core
 
+model Device {
+  id         String   @id @default(cuid())
+  deviceId   String
+  platform   String
+  pushToken  String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
 model User {
   id             String           @id @default(cuid())
   email          String           @unique
@@ -62,14 +71,13 @@ model PasswordToken {
 
   user User @relation(fields: [userId], references: [id])
 
-  @@index([userId])   // <-- model-level index, not @index
+  @@index([userId])
 }
-
 
 // Billing
 
 model Subscription {
-  id               String   @id        // store "stripe_<subId>"
+  id               String   @id       // store "stripe_<subId>"
   orgId            String
   provider         String
   status           String
