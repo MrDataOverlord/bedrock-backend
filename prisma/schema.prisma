@@ -1,4 +1,3 @@
-// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,7 +7,7 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-/* ---------- Core ---------- */
+// Core
 
 model User {
   id             String           @id @default(cuid())
@@ -50,7 +49,7 @@ model Member {
   @@index([userId])
 }
 
-/* ---------- Password / Registration ---------- */
+// Password / Registration
 
 model PasswordToken {
   id         String   @id @default(cuid())
@@ -66,17 +65,17 @@ model PasswordToken {
   @@index([userId])
 }
 
-/* ---------- Billing ---------- */
+// Billing
 
 model Subscription {
-  id               String    @id          // store "stripe_<subId>"
+  id               String   @id        // store "stripe_<subId>"
   orgId            String
   provider         String
   status           String
   currentPeriodEnd DateTime?
   customerId       String?
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
   org Org @relation(fields: [orgId], references: [id])
 
