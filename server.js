@@ -1,17 +1,18 @@
 /* =========================================================================
    Bedrock Backend — Express + Stripe + Prisma + Resend (optional)
-   - Auth: email + password
-   - Billing: Stripe Checkout + Webhooks
-   - Registration: email link after successful payment
-   - Entitlements: /entitlements reflects active sub and days remaining
-   -------------------------------------------------------------------------
-   Notes:
-   * Webhook path is /webhooks/stripe  (expects raw body)
-   * CORS allowlist via CORS_ORIGINS env (comma-separated)
-   * Uses STRIPE_PRICE_PREMIUM (preferred) OR STRIPE_PRICE_ID (legacy)
    ========================================================================= */
 
-import 'dotenv/config';
+/* Optional .env loader: only in non-production and only if installed */
+if (process.env.NODE_ENV !== 'production') {
+  try {
+    // loads .env if the 'dotenv' package is present locally
+    await import('dotenv/config');
+    console.log('[env] .env loaded via dotenv');
+  } catch {
+    // safe to ignore on Render/production
+  }
+}
+
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
@@ -33,28 +34,24 @@ const {
   STRIPE_WEBHOOK_SECRET = '',
   STRIPE_PRICE_PREMIUM = '',      // preferred modern name
   RESEND_API_KEY = '',            // optional (emails); omit to log-only
-  RESEND_FROM = 'no-reply@yourdomain.com', // shown in messages if using Resend
+  RESEND_FROM = 'no-reply@yourdomain.com',
   APP_NAME = 'Bedrock',
 } = process.env;
 
-// Support both STRIPE_PRICE_PREMIUM and legacy STRIPE_PRICE_ID
-const PRICE_ID = STRIPE_PRICE_PREMIUM || process.env.STRIPE_PRICE_ID || "";
+// Accept legacy STRIPE_PRICE_ID as well
+const PRICE_ID = STRIPE_PRICE_PREMIUM || process.env.STRIPE_PRICE_ID || '';
 if (!PRICE_ID) {
-  console.error("[CONFIG] Missing Stripe price id. Set STRIPE_PRICE_PREMIUM (preferred) or STRIPE_PRICE_ID.");
+  console.error('[CONFIG] Missing Stripe price id. Set STRIPE_PRICE_PREMIUM (preferred) or STRIPE_PRICE_ID.');
   process.exit(1);
 } else {
   console.log(`[CONFIG] Using Stripe price id: ${PRICE_ID}`);
 }
 
-/* ====== Safety checks ==================================================== */
-
 if (!JWT_SECRET) {
-  console.error('JWT_SECRET is required');
-  process.exit(1);
+  console.error('JWT_SECRET is required'); process.exit(1);
 }
 if (!STRIPE_SECRET_KEY) {
-  console.error('STRIPE_SECRET_KEY is required');
-  process.exit(1);
+  console.error('STRIPE_SECRET_KEY is required'); process.exit(1);
 }
 if (!STRIPE_WEBHOOK_SECRET) {
   console.warn('WARNING: STRIPE_WEBHOOK_SECRET is not set — webhooks will fail to verify.');
@@ -63,9 +60,7 @@ if (!STRIPE_WEBHOOK_SECRET) {
 /* ====== Init ============================================================= */
 
 const prisma = new PrismaClient();
-const stripe = new Stripe(STRIPE_SECRET_KEY, {
-  apiVersion: '2024-06-20',
-});
+const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2024-06-20' });
 
 /* ====== Email (Resend optional) ========================================= */
 
@@ -74,15 +69,9 @@ async function sendEmail({ to, subject, html }) {
     console.log('[email:mock]', { to, subject, html: html?.slice(0, 140) + '...' });
     return;
   }
-  // Lazy import so runtime doesn’t require it if not used
-  const { Resend } = await import('resend');
+  const { Resend } = await import('resend'); // only loaded when key is present
   const resend = new Resend(RESEND_API_KEY);
-  await resend.emails.send({
-    from: RESEND_FROM,
-    to,
-    subject,
-    html,
-  });
+  await resend.emails.send({ from: RESEND_FROM, to, subject, html });
 }
 
 function buildRegistrationEmail({ email, token }) {
@@ -103,21 +92,15 @@ function buildRegistrationEmail({ email, token }) {
 }
 
 async function issuePasswordToken(userId) {
-  // create a single-use token, store a SHA256 hash
   const raw = crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
   await prisma.passwordToken.create({
-    data: {
-      userId,
-      purpose: 'register',
-      tokenHash,
-      expiresAt,
-    },
+    data: { userId, purpose: 'register', tokenHash, expiresAt },
   });
 
-  return raw; // send raw to user via email
+  return raw;
 }
 
 async function sendRegistrationEmail(email, userId) {
@@ -136,12 +119,8 @@ function requireAuth(req, res, next) {
   const auth = req.headers.authorization || '';
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Missing token' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: 'Invalid token' }); }
 }
 
 /* ====== App ============================================================= */
@@ -161,18 +140,15 @@ console.log('[CORS allowlist]', allow);
 
 app.use(cors({
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // curl/postman/native apps
+    if (!origin) return cb(null, true);
     const ok = allow.some(a => origin === a || origin.endsWith(a.replace(/^\*+/, '')));
     cb(null, ok);
   },
   credentials: true,
 }));
-app.use((req, res, next) => {
-  res.header('Vary', 'Origin');
-  next();
-});
+app.use((req, res, next) => { res.header('Vary', 'Origin'); next(); });
 
-// Body parsers (DO NOT apply JSON to the Stripe webhook route)
+// Body parsers (JSON everywhere except Stripe webhook)
 app.use(cookieParser());
 app.use(express.json({ limit: '1mb' }));
 
@@ -184,10 +160,6 @@ app.get('/health', (_req, res) => {
 
 /* ====== Auth ============================================================= */
 
-// Direct public signup is disabled — accounts are provisioned after payment.
-// Users will receive an email to set their password via a one-time token.
-
-// Login
 app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = (req.body || {});
@@ -207,13 +179,12 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// Request password reset (optional)
 app.post('/auth/request-reset', async (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Missing email' });
     const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) return res.json({ ok: true }); // do not reveal
+    if (!user) return res.json({ ok: true });
 
     const raw = await issuePasswordToken(user.id);
     const url = `${FRONTEND_URL.replace(/\/$/, '')}/reset/complete?token=${encodeURIComponent(raw)}&email=${encodeURIComponent(email)}`;
@@ -229,7 +200,6 @@ app.post('/auth/request-reset', async (req, res) => {
   }
 });
 
-// Set password via token
 app.post('/auth/set-password', async (req, res) => {
   try {
     const { email, token, password } = req.body || {};
@@ -264,7 +234,6 @@ app.post('/auth/set-password', async (req, res) => {
 
 /* ====== Billing ========================================================== */
 
-// Public checkout (email captured by Stripe)
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
@@ -281,9 +250,7 @@ app.post('/billing/checkout_public', async (req, res) => {
       cancel_url: cancelUrl,
       allow_promotion_codes: true,
       billing_address_collection: 'auto',
-      subscription_data: {
-        metadata: { email },
-      },
+      subscription_data: { metadata: { email } },
       metadata: { email, flow: 'public' },
     });
 
@@ -294,7 +261,6 @@ app.post('/billing/checkout_public', async (req, res) => {
   }
 });
 
-// Auth’d checkout (attach to existing Stripe customer if you track it)
 app.post('/billing/checkout', requireAuth, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.sub } });
@@ -311,9 +277,7 @@ app.post('/billing/checkout', requireAuth, async (req, res) => {
       cancel_url: cancelUrl,
       allow_promotion_codes: true,
       billing_address_collection: 'auto',
-      subscription_data: {
-        metadata: { email: user.email, appUserId: user.id },
-      },
+      subscription_data: { metadata: { email: user.email, appUserId: user.id } },
       metadata: { email: user.email, appUserId: user.id, flow: 'auth' },
     });
 
@@ -324,7 +288,6 @@ app.post('/billing/checkout', requireAuth, async (req, res) => {
   }
 });
 
-// Entitlements: days remaining + subscription status
 app.get('/entitlements', requireAuth, async (req, res) => {
   try {
     const member = await prisma.member.findFirst({
@@ -332,10 +295,7 @@ app.get('/entitlements', requireAuth, async (req, res) => {
       include: {
         org: {
           include: {
-            subscriptions: {
-              orderBy: { createdAt: 'desc' },
-              take: 1,
-            },
+            subscriptions: { orderBy: { createdAt: 'desc' }, take: 1 },
           },
         },
       },
@@ -360,10 +320,10 @@ app.get('/entitlements', requireAuth, async (req, res) => {
 });
 
 /* ====== Stripe Webhook =================================================== */
-/* IMPORTANT: Use express.raw() here and ONLY here so signature verifies.   */
 
-app.post('/webhooks/stripe',
-  express.raw({ type: 'application/json' }),
+app.post(
+  '/webhooks/stripe',
+  express.raw({ type: 'application/json' }), // raw body for signature verification
   async (req, res) => {
     let event;
     try {
@@ -381,7 +341,6 @@ app.post('/webhooks/stripe',
           const email = (session.customer_details?.email || session.customer_email || session.metadata?.email || '').toLowerCase().trim();
           if (!email) break;
 
-          // Ensure user + org
           let user = await prisma.user.findUnique({ where: { email } });
           if (!user) {
             user = await prisma.user.create({
@@ -401,22 +360,15 @@ app.post('/webhooks/stripe',
               },
             });
           } else {
-            // ensure at least one membership (owner of a default org if missing)
             const hasMember = await prisma.member.findFirst({ where: { userId: user.id } });
             if (!hasMember) {
               const org = await prisma.org.create({
-                data: {
-                  ownerUserId: user.id,
-                  name: `${email}'s Org`,
-                },
+                data: { ownerUserId: user.id, name: `${email}'s Org` },
               });
-              await prisma.member.create({
-                data: { orgId: org.id, userId: user.id, role: 'owner' },
-              });
+              await prisma.member.create({ data: { orgId: org.id, userId: user.id, role: 'owner' } });
             }
           }
 
-          // Create subscription row
           if (session.subscription) {
             const sub = await stripe.subscriptions.retrieve(session.subscription);
             const org = await prisma.member.findFirst({ where: { userId: user.id }, include: { org: true } });
@@ -440,7 +392,6 @@ app.post('/webhooks/stripe',
             }
           }
 
-          // Send registration email if user has no password set
           if (user && !user.passwordHash) {
             await sendRegistrationEmail(email, user.id);
           }
@@ -450,7 +401,6 @@ app.post('/webhooks/stripe',
 
         case 'invoice.payment_succeeded': {
           const invoice = event.data.object;
-          // Refresh subscription record on renewal
           if (invoice.subscription) {
             const sub = await stripe.subscriptions.retrieve(invoice.subscription);
             await prisma.subscription.upsert({
@@ -458,7 +408,6 @@ app.post('/webhooks/stripe',
               create: {
                 id: `stripe_${sub.id}`,
                 orgId: (await (async () => {
-                  // find an org by customer email if possible
                   const cust = typeof sub.customer === 'string'
                     ? await stripe.customers.retrieve(sub.customer)
                     : sub.customer;
@@ -485,7 +434,6 @@ app.post('/webhooks/stripe',
         }
 
         default:
-          // no-op
           break;
       }
 
@@ -497,9 +445,7 @@ app.post('/webhooks/stripe',
   }
 );
 
-/* ====== Fallback JSON parser for everything else ======================== */
-
-// This must come AFTER the webhook route (which uses raw body above)
+// generic error handler (after routes)
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error', err);
   res.status(500).json({ error: 'Server error' });
