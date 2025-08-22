@@ -31,7 +31,7 @@ const {
 
   // Registration
   // The page on your Wix site that accepts ?token=... (e.g. https://www.nerdherdmc.net/account/set-password)
-  REG_URL_BASE = "https://www.nerdherdmc.net/account/set-password",
+  REG_URL_BASE = "https://www.nerdherdmc.net/set-password",
 
   // SMTP for Namescheap PrivateEmail
   SMTP_HOST = "mail.privateemail.com",
@@ -147,11 +147,14 @@ async function issuePasswordToken(userId, purpose = "register", ttlMinutes = 60)
 
   return raw; // raw goes to email
 }
-
-function setPasswordLink(rawToken) {
-  // You said your Wix page should take ?token=
-  return `${REG_URL_BASE}?token=${encodeURIComponent(rawToken)}`;
-}
+ function setPasswordLink(rawToken, email) {
+   // Wix page can read both query params
+   const q = new URLSearchParams({
+     token: rawToken,
+     email
+   }).toString();
+   return `${REG_URL_BASE}?${q}`;
+ }
 
 /* =========================
    Stripe: Checkout
@@ -241,7 +244,7 @@ app.post(
           // If no password yet, issue token + email the user
           if (!user.passwordHash) {
             const rawToken = await issuePasswordToken(user.id, "register", 120); // 2h TTL
-            const url = setPasswordLink(rawToken);
+            const url = setPasswordLink(rawToken, email);
 
             await sendMail({
               to: email,
@@ -301,6 +304,92 @@ app.post(
 
 // JSON parser for the rest of routes (after webhook)
 app.use(express.json());
+
+/* =========================
+   Auth: complete registration (set password)
+========================= */
+app.post("/auth/register/complete", async (req, res) => {
+  try {
+    const { email, token, password } = req.body || {};
+
+    if (!email || !token || !password) {
+      return res.status(400).json({ error: "email, token and password are required" });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ error: "password must be at least 8 characters" });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { email },
+      include: {
+        passwordTokens: {
+          where: {
+            purpose: "register",
+            usedAt: null,
+            expiresAt: { gt: new Date() },
+          },
+          orderBy: { createdAt: "desc" },
+        },
+      },
+    });
+
+    if (!user) return res.status(404).json({ error: "user not found" });
+
+    // Find a matching token (bcrypt compare)
+    let matching = null;
+    for (const t of user.passwordTokens) {
+      const ok = await bcrypt.compare(token, t.tokenHash);
+      if (ok) {
+        matching = t;
+        break;
+      }
+    }
+    if (!matching) return res.status(400).json({ error: "invalid or expired token" });
+
+    // Set password
+    const hash = await bcrypt.hash(password, 10);
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash: hash },
+      }),
+      prisma.passwordToken.update({
+        where: { id: matching.id },
+        data: { usedAt: new Date() },
+      }),
+      // Optional: invalidate any other outstanding register tokens
+      prisma.passwordToken.deleteMany({
+        where: {
+          userId: user.id,
+          purpose: "register",
+          usedAt: null,
+          NOT: { id: matching.id },
+        },
+      }),
+    ]);
+
+    // Optional: ensure they have an Org + owner membership
+    const existingOrg = await prisma.org.findFirst({ where: { ownerUserId: user.id } });
+    if (!existingOrg) {
+      const org = await prisma.org.create({
+        data: {
+          ownerUserId: user.id,
+          name: `Org ${user.email}`,
+        },
+      });
+      // best-effort create membership (ignore unique dup)
+      await prisma.member.create({
+        data: { userId: user.id, orgId: org.id, role: "owner" },
+      }).catch(() => {});
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[register/complete] ERROR", e);
+    return res.status(500).json({ error: "failed to complete registration" });
+  }
+});
+
 
 /* =========================
    Health + Debug mail
