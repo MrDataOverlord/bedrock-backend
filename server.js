@@ -21,7 +21,7 @@ const {
 
   // Auth / App
   JWT_SECRET,
-  CORS_ORIGINS = "",            // comma-separated
+  CORS_ORIGINS = "",            // comma-separated list
   APP_DOMAIN = "https://bedrock-backend-ipj6.onrender.com",
 
   // Stripe
@@ -30,19 +30,18 @@ const {
   STRIPE_PRICE_PREMIUM,
 
   // Registration
-  // The page on your Wix site that accepts ?token=... (e.g. https://www.nerdherdmc.net/account/set-password)
+  // Wix page that receives ?token=...&email=... (e.g. https://www.nerdherdmc.net/account/set-password)
   REG_URL_BASE = "https://www.nerdherdmc.net/set-password",
 
-  // SMTP for Namescheap PrivateEmail
+  // SMTP (Namescheap PrivateEmail)
   SMTP_HOST = "mail.privateemail.com",
   SMTP_PORT = "465",
   SMTP_SECURE = "true", // "true" for 465, "false" for 587
   SMTP_USER,            // support@nerdherdmc.com
   SMTP_PASS,
-  EMAIL_FROM            // optional, defaults to SMTP_USER
+  EMAIL_FROM            // optional (defaults to SMTP_USER)
 } = process.env;
 
-// Basic env checks (fail fast, with readable errors)
 function must(name, val) {
   if (!val) throw new Error(`${name} is required`);
 }
@@ -61,7 +60,6 @@ const prisma = new PrismaClient();
 ========================= */
 const app = express();
 
-// Security / rate-limit / CORS / logs
 app.use(helmet());
 app.use(
   rateLimit({
@@ -72,30 +70,42 @@ app.use(
   })
 );
 
-// Allow your site + localhost dev
-const corsOrigins = CORS_ORIGINS
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const corsOrigins = CORS_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // allow curl/postman
+      if (!origin) return cb(null, true);                 // allow curl/postman
       if (corsOrigins.includes(origin)) return cb(null, true);
       return cb(null, false);
     },
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
+    exposedHeaders: ["Authorization"],
   })
 );
 
 app.use(morgan("dev"));
 
-// IMPORTANT: Do NOT put express.json() before Stripe webhook.
-// We’ll add json() after the webhook route.
+// DO NOT add express.json() before the Stripe webhook.
+// We'll add it after the webhook.
 
-// Small helpers
+/* =========================
+   Helpers
+========================= */
 const signJwt = (payload, exp = "72h") =>
   jwt.sign(payload, JWT_SECRET, { expiresIn: exp });
+
+function authMiddleware(req, res, next) {
+  const hdr = req.headers.authorization || "";
+  const m = hdr.match(/^Bearer\s+(.+)$/i);
+  if (!m) return res.status(401).json({ error: "missing bearer token" });
+  try {
+    req.user = jwt.verify(m[1], JWT_SECRET);
+    return next();
+  } catch (e) {
+    return res.status(401).json({ error: "invalid token" });
+  }
+}
 
 /* =========================
    Email (Nodemailer)
@@ -103,7 +113,7 @@ const signJwt = (payload, exp = "72h") =>
 const transporter = nodemailer.createTransport({
   host: SMTP_HOST,
   port: Number(SMTP_PORT),
-  secure: String(SMTP_SECURE).toLowerCase() === "true", // 465 -> true, 587 -> false
+  secure: String(SMTP_SECURE).toLowerCase() === "true",
   auth: { user: SMTP_USER, pass: SMTP_PASS },
 });
 
@@ -118,46 +128,33 @@ async function verifyTransporter() {
 
 async function sendMail({ to, subject, html, text }) {
   const from = EMAIL_FROM || SMTP_USER;
-  try {
-    const info = await transporter.sendMail({ from, to, subject, html, text });
-    console.log("[mail] sent:", { to, subject, messageId: info.messageId });
-    return info;
-  } catch (e) {
-    console.error("[mail] send FAILED:", { to, subject, error: e.message });
-    throw e;
-  }
+  const info = await transporter.sendMail({ from, to, subject, html, text });
+  console.log("[mail] sent:", { to, subject, messageId: info.messageId });
+  return info;
 }
 
 /* =========================
    Token helpers
 ========================= */
-async function issuePasswordToken(userId, purpose = "register", ttlMinutes = 60) {
+async function issuePasswordToken(userId, purpose = "register", ttlMinutes = 120) {
   const raw = crypto.randomBytes(32).toString("hex");
   const tokenHash = await bcrypt.hash(raw, 10);
-
   const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+
   await prisma.passwordToken.create({
-    data: {
-      userId,
-      purpose,
-      tokenHash,
-      expiresAt,
-    },
+    data: { userId, purpose, tokenHash, expiresAt },
   });
 
   return raw; // raw goes to email
 }
- function setPasswordLink(rawToken, email) {
-   // Wix page can read both query params
-   const q = new URLSearchParams({
-     token: rawToken,
-     email
-   }).toString();
-   return `${REG_URL_BASE}?${q}`;
- }
+
+function setPasswordLink(rawToken, email) {
+  const q = new URLSearchParams({ token: rawToken, email }).toString();
+  return `${REG_URL_BASE}?${q}`;
+}
 
 /* =========================
-   Stripe: Checkout
+   Stripe: Checkout (public)
 ========================= */
 app.post("/billing/checkout_public", express.json(), async (req, res) => {
   try {
@@ -166,12 +163,9 @@ app.post("/billing/checkout_public", express.json(), async (req, res) => {
 
     console.log("[checkout_public] start", { email });
 
-    // Create or fetch user
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-      user = await prisma.user.create({
-        data: { email },
-      });
+      user = await prisma.user.create({ data: { email } });
       console.log("[checkout_public] created user", { id: user.id, email });
     }
 
@@ -179,18 +173,12 @@ app.post("/billing/checkout_public", express.json(), async (req, res) => {
       mode: "subscription",
       customer_email: email,
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      success_url:
-        (returnUrl && `${returnUrl}`) || `${APP_DOMAIN}/billing/success`,
+      success_url: (returnUrl && `${returnUrl}`) || `${APP_DOMAIN}/billing/success`,
       cancel_url: `${APP_DOMAIN}/billing/cancelled`,
       allow_promotion_codes: true,
-      // optional: automatic_tax, trial, etc.
     });
 
-    console.log("[checkout_public] session created", {
-      id: session.id,
-      url: session.url,
-    });
-
+    console.log("[checkout_public] session created", { id: session.id, url: session.url });
     res.json({ url: session.url });
   } catch (e) {
     console.error("[checkout_public] ERROR", e);
@@ -201,7 +189,6 @@ app.post("/billing/checkout_public", express.json(), async (req, res) => {
 /* =========================
    Stripe Webhook
 ========================= */
-// Use raw body so we can verify Stripe signature
 app.post(
   "/webhooks/stripe",
   bodyParser.raw({ type: "application/json" }),
@@ -210,11 +197,7 @@ app.post(
     let event;
 
     try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        STRIPE_WEBHOOK_SECRET
-      );
+      event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
     } catch (err) {
       console.error("[webhook] signature verify FAILED:", err.message);
       return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -225,27 +208,20 @@ app.post(
 
       if (event.type === "checkout.session.completed") {
         const session = event.data.object;
-        const email =
-          session?.customer_details?.email || session?.customer_email;
+        const email = session?.customer_details?.email || session?.customer_email;
 
-        console.log("[webhook] checkout.session.completed", {
-          session: session.id,
-          email,
-        });
+        console.log("[webhook] checkout.session.completed", { session: session.id, email });
 
         if (email) {
           let user = await prisma.user.findUnique({ where: { email } });
           if (!user) {
-            // Very rare: we didn't pre-create in checkout_public
             user = await prisma.user.create({ data: { email } });
             console.log("[webhook] created user for email", { id: user.id });
           }
 
-          // If no password yet, issue token + email the user
           if (!user.passwordHash) {
-            const rawToken = await issuePasswordToken(user.id, "register", 120); // 2h TTL
+            const rawToken = await issuePasswordToken(user.id, "register", 120);
             const url = setPasswordLink(rawToken, email);
-
             await sendMail({
               to: email,
               subject: "Set your Bedrock Utilities password",
@@ -265,19 +241,13 @@ app.post(
       if (event.type === "invoice.payment_failed") {
         const invoice = event.data.object;
         const email = invoice?.customer_email || invoice?.customer_details?.email;
-
-        console.log("[webhook] invoice.payment_failed", {
-          invoice: invoice.id,
-          email,
-        });
+        console.log("[webhook] invoice.payment_failed", { invoice: invoice.id, email });
 
         if (email) {
           await sendMail({
             to: email,
             subject: "Payment failed — subscription on hold",
-            text:
-              "Your recent payment failed and your premium access is on hold. " +
-              "Please update your payment method in the Billing Portal to restore access.",
+            text: "Your recent payment failed and your premium access is on hold. Please update your payment method to restore access.",
             html: `
               <p>Your recent payment failed and your premium access is on hold.</p>
               <p>Please update your payment method to restore access.</p>
@@ -289,20 +259,17 @@ app.post(
       if (event.type === "invoice.payment_succeeded") {
         const invoice = event.data.object;
         console.log("[webhook] invoice.payment_succeeded", { invoice: invoice.id });
-        // (Optional) update your Subscription table with next period end using invoice.lines/subscription info.
       }
 
-      // Always 200 so Stripe doesn't retry unless we truly had a bad signature above
       return res.json({ received: true });
     } catch (err) {
       console.error("[webhook] handler ERROR:", err);
-      // Still return 200 to stop endless retries; everything important is logged.
       return res.json({ received: true });
     }
   }
 );
 
-// JSON parser for the rest of routes (after webhook)
+// JSON parser for all routes after Stripe webhook.
 app.use(express.json());
 
 /* =========================
@@ -311,7 +278,6 @@ app.use(express.json());
 app.post("/auth/register/complete", async (req, res) => {
   try {
     const { email, token, password } = req.body || {};
-
     if (!email || !token || !password) {
       return res.status(400).json({ error: "email, token and password are required" });
     }
@@ -323,83 +289,94 @@ app.post("/auth/register/complete", async (req, res) => {
       where: { email },
       include: {
         passwordTokens: {
-          where: {
-            purpose: "register",
-            usedAt: null,
-            expiresAt: { gt: new Date() },
-          },
+          where: { purpose: "register", usedAt: null, expiresAt: { gt: new Date() } },
           orderBy: { createdAt: "desc" },
         },
       },
     });
-
     if (!user) return res.status(404).json({ error: "user not found" });
 
-    // Find a matching token (bcrypt compare)
+    // Find matching token
     let matching = null;
     for (const t of user.passwordTokens) {
-      const ok = await bcrypt.compare(token, t.tokenHash);
-      if (ok) {
-        matching = t;
-        break;
-      }
+      if (await bcrypt.compare(token, t.tokenHash)) { matching = t; break; }
     }
     if (!matching) return res.status(400).json({ error: "invalid or expired token" });
 
-    // Set password
     const hash = await bcrypt.hash(password, 10);
     await prisma.$transaction([
-      prisma.user.update({
-        where: { id: user.id },
-        data: { passwordHash: hash },
-      }),
-      prisma.passwordToken.update({
-        where: { id: matching.id },
-        data: { usedAt: new Date() },
-      }),
-      // Optional: invalidate any other outstanding register tokens
+      prisma.user.update({ where: { id: user.id }, data: { passwordHash: hash } }),
+      prisma.passwordToken.update({ where: { id: matching.id }, data: { usedAt: new Date() } }),
       prisma.passwordToken.deleteMany({
-        where: {
-          userId: user.id,
-          purpose: "register",
-          usedAt: null,
-          NOT: { id: matching.id },
-        },
+        where: { userId: user.id, purpose: "register", usedAt: null, NOT: { id: matching.id } },
       }),
     ]);
 
-    // Optional: ensure they have an Org + owner membership
+    // Ensure org + owner membership (best-effort)
     const existingOrg = await prisma.org.findFirst({ where: { ownerUserId: user.id } });
     if (!existingOrg) {
       const org = await prisma.org.create({
-        data: {
-          ownerUserId: user.id,
-          name: `Org ${user.email}`,
-        },
+        data: { ownerUserId: user.id, name: `Org ${user.email}` },
       });
-      // best-effort create membership (ignore unique dup)
-      await prisma.member.create({
-        data: { userId: user.id, orgId: org.id, role: "owner" },
-      }).catch(() => {});
+      await prisma.member.create({ data: { userId: user.id, orgId: org.id, role: "owner" } }).catch(() => {});
     }
 
-    return res.json({ ok: true });
+    // Optionally return a JWT so clients can auto-sign-in if they want
+    const jwtToken = signJwt({ sub: user.id, email: user.email });
+    return res.json({ ok: true, token: jwtToken });
   } catch (e) {
     console.error("[register/complete] ERROR", e);
     return res.status(500).json({ error: "failed to complete registration" });
   }
 });
 
+/* =========================
+   Auth: login
+========================= */
+const loginLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.post("/auth/login", loginLimiter, async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: "email and password are required" });
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user || !user.passwordHash) return res.status(401).json({ error: "invalid credentials" });
+
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: "invalid credentials" });
+
+    const token = signJwt({ sub: user.id, email: user.email });
+    // Return both the token and a small user payload
+    return res.json({ token, user: { id: user.id, email: user.email } });
+  } catch (e) {
+    console.error("[auth/login] ERROR", e);
+    return res.status(500).json({ error: "login failed" });
+  }
+});
 
 /* =========================
-   Health + Debug mail
+   Auth: whoami (optional)
+========================= */
+app.get("/auth/me", authMiddleware, async (req, res) => {
+  const user = await prisma.user.findUnique({
+    where: { id: req.user.sub },
+    select: { id: true, email: true, createdAt: true },
+  });
+  return res.json({ user });
+});
+
+/* =========================
+   Health + dev mail
 ========================= */
 app.get("/health", (_req, res) => {
   res.json({ ok: true, env: NODE_ENV, ts: new Date().toISOString() });
 });
 
-// Quick functional test for the mailer without Stripe
-// GET /dev/send-test?to=email@domain.com
 app.get("/dev/send-test", async (req, res) => {
   try {
     const to = req.query.to;
@@ -417,7 +394,7 @@ app.get("/dev/send-test", async (req, res) => {
 });
 
 /* =========================
-   Success pages (basic)
+   Minimal success pages
 ========================= */
 app.get("/billing/success", (_req, res) => {
   res.type("html").send("<h1>Payment success</h1><p>You can close this tab.</p>");
