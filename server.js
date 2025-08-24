@@ -34,12 +34,12 @@ if (!STRIPE_PRICE_PREMIUM) throw new Error('STRIPE_PRICE_PREMIUM is required');
 
 // ---------- init ----------
 const app = express();
-app.set('trust proxy', 1); // behind Render; silences rate-limit warning re: x-forwarded-for
+app.set('trust proxy', 1); // Render / proxies
 
 const prisma = new PrismaClient();
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 
-// Health is plain
+// Health is plain (no JSON body parse needed)
 app.use('/health', (req, res, next) => next());
 
 // CORS
@@ -50,9 +50,9 @@ const allowed = (CORS_ORIGINS || '')
 
 app.use(
   cors({
-    origin: function (origin, cb) {
+    origin: (origin, cb) => {
       if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-      return cb(new Error('Not allowed by CORS: ' + origin));
+      cb(new Error('Not allowed by CORS: ' + origin));
     },
     credentials: true,
   })
@@ -69,11 +69,10 @@ const limiter = rateLimit({
 app.use(limiter);
 
 // ---------- utilities ----------
-function log(...args) { console.log(...args); }
+const log = (...a) => console.log(...a);
 
-function signAccess(user) {
-  return jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
-}
+const signAccess = (user) =>
+  jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
 
 function auth(req, res, next) {
   try {
@@ -108,7 +107,6 @@ async function issueRegistrationToken(userId) {
   const raw = crypto.randomBytes(32).toString('hex');
   const tokenHash = await bcrypt.hash(raw, 10);
   const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24); // 24h
-
   await prisma.passwordToken.create({
     data: { userId, tokenHash, purpose: 'register', expiresAt },
   });
@@ -129,25 +127,22 @@ async function sendRegistrationEmail(email, rawToken) {
 }
 
 // ---------- Stripe raw body handling ----------
-// Keep global JSON parsing, but preserve the raw payload for Stripe signature verification.
 app.use(express.json({
   verify: (req, _res, buf) => {
     if (req.originalUrl === '/webhooks/stripe') {
       // @ts-ignore
-      req.rawBody = buf; // Buffer
+      req.rawBody = buf; // Buffer for signature verify
     }
   }
 }));
 
 // ---------- Org / Member / Subscription helpers ----------
-
 function isPremium(status, end) {
   const s = String(status || '').toLowerCase();
   return (s === 'active' || s === 'trialing') && end instanceof Date && end.getTime() > Date.now();
 }
 
 async function ensureOrgAndMember({ userId, customerId, customerName, email }) {
-  // Find or create Org by Stripe customer
   let org = await prisma.org.findFirst({ where: { stripeCustomerId: customerId } });
   if (!org) {
     const fallbackName = customerName || (email ? `${email.split('@')[0]}'s Org` : 'Account');
@@ -156,7 +151,6 @@ async function ensureOrgAndMember({ userId, customerId, customerName, email }) {
     });
   }
 
-  // Ensure membership (owner if first)
   if (userId) {
     try {
       await prisma.member.upsert({
@@ -180,7 +174,7 @@ async function upsertSubscription({ orgId, sub }) {
     create: {
       id,
       orgId,
-      provider: 'stripe',        // ignore if your schema doesn’t have this field
+      provider: 'stripe', // ignore if not in your schema
       status: sub.status,
       currentPeriodEnd: end,
       customerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id
@@ -201,22 +195,18 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, env: NODE_ENV, ts: new Date().toISOString() });
 });
 
-// Login: { email, password } -> { access }
+// Auth: login
 app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
-
   const user = await prisma.user.findUnique({ where: { email } });
   if (!user || !user.passwordHash) return res.status(401).json({ error: 'Invalid credentials' });
-
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-
-  const access = signAccess(user);
-  res.json({ access });
+  res.json({ access: signAccess(user) });
 });
 
-// Complete registration: { email, token, password }
+// Auth: complete registration (from emailed token)
 app.post('/auth/register/complete', async (req, res) => {
   const { email, token, password } = req.body || {};
   if (!email || !token || !password) return res.status(400).json({ error: 'Missing fields' });
@@ -226,12 +216,7 @@ app.post('/auth/register/complete', async (req, res) => {
   if (user.passwordHash) return res.status(400).json({ error: 'Password already set' });
 
   const tok = await prisma.passwordToken.findFirst({
-    where: {
-      userId: user.id,
-      purpose: 'register',
-      usedAt: null,
-      expiresAt: { gt: new Date() },
-    },
+    where: { userId: user.id, purpose: 'register', usedAt: null, expiresAt: { gt: new Date() } },
     orderBy: { createdAt: 'desc' },
   });
   if (!tok) return res.status(400).json({ error: 'Token not found or expired' });
@@ -248,13 +233,13 @@ app.post('/auth/register/complete', async (req, res) => {
   res.json({ ok: true });
 });
 
-// Manual re-send registration email (only if password is not set yet)
+// Auth: resend registration email (if not set yet)
 app.post('/auth/register/resend', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
 
   const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) return res.status(200).json({ ok: true }); // do not reveal
+  if (!user) return res.status(200).json({ ok: true }); // avoid enumeration
   if (user.passwordHash) return res.status(200).json({ ok: true, note: 'already_has_password' });
 
   const raw = await issueRegistrationToken(user.id);
@@ -266,20 +251,17 @@ app.post('/auth/register/resend', async (req, res) => {
    C) Forgot Password flow
    ======================= */
 
-// Start reset: { email }
+// Start reset
 app.post('/auth/reset/start', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
 
   const user = await prisma.user.findUnique({ where: { email } });
-
-  // Always return 200 to prevent user enumeration
-  if (!user) return res.json({ ok: true });
+  if (!user) return res.json({ ok: true }); // don’t reveal
 
   const raw = crypto.randomBytes(32).toString('hex');
   const tokenHash = await bcrypt.hash(raw, 10);
   const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24); // 24h
-
   await prisma.passwordToken.create({
     data: { userId: user.id, tokenHash, purpose: 'reset', expiresAt },
   });
@@ -300,7 +282,7 @@ app.post('/auth/reset/start', async (req, res) => {
   res.json({ ok: true });
 });
 
-// Complete reset: { email, token, newPassword }
+// Complete reset
 app.post('/auth/reset/complete', async (req, res) => {
   const { email, token, newPassword } = req.body || {};
   if (!email || !token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
@@ -309,12 +291,7 @@ app.post('/auth/reset/complete', async (req, res) => {
   if (!user) return res.status(400).json({ error: 'User not found' });
 
   const tok = await prisma.passwordToken.findFirst({
-    where: {
-      userId: user.id,
-      purpose: 'reset',
-      usedAt: null,
-      expiresAt: { gt: new Date() },
-    },
+    where: { userId: user.id, purpose: 'reset', usedAt: null, expiresAt: { gt: new Date() } },
     orderBy: { createdAt: 'desc' },
   });
   if (!tok) return res.status(400).json({ error: 'Token not found or expired' });
@@ -331,7 +308,7 @@ app.post('/auth/reset/complete', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Entitlements (user + orgs + premium) ----------
+// ---------- Entitlements ----------
 async function getEntitlementsPayload(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
 
@@ -368,12 +345,10 @@ async function getEntitlementsPayload(userId) {
 }
 
 app.get('/account/me', auth, async (req, res) => {
-  const payload = await getEntitlementsPayload(req.user.sub);
-  res.json(payload);
+  res.json(await getEntitlementsPayload(req.user.sub));
 });
 app.get('/entitlements', auth, async (req, res) => {
-  const payload = await getEntitlementsPayload(req.user.sub);
-  res.json(payload);
+  res.json(await getEntitlementsPayload(req.user.sub));
 });
 
 // ---------- Public checkout (Wix -> backend -> Stripe) ----------
@@ -386,23 +361,42 @@ app.post('/billing/checkout_public', async (req, res) => {
       mode: 'subscription',
       customer_email: email,
       success_url: returnUrl || 'https://bedrock-backend-ipj6.onrender.com/billing/success',
-      cancel_url: returnUrl || 'https://bedrock-backend-ipj6.onrender.com/billing/cancel',
+      cancel_url:  returnUrl || 'https://bedrock-backend-ipj6.onrender.com/billing/cancel',
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
       allow_promotion_codes: true,
     });
 
     res.json({ url: session.url, id: session.id });
   } catch (e) {
-    log('[checkout_public] error:', e?.message);
-    res.status(500).json({ error: 'Checkout failed' });
+    const msg  = e?.raw?.message || e?.message || 'Checkout failed';
+    const code = e?.code || e?.raw?.code || e?.type;
+    console.error('[checkout_public] error:', { code, msg });
+    res.status(500).json({ error: 'Checkout failed', detail: msg, code });
   }
 });
 
-app.get('/billing/success', (req, res) => res.send('Payment success\nYou can close this tab.'));
-app.get('/billing/cancel', (req, res) => res.send('Payment canceled'));
+// Optional: quick Stripe price sanity endpoint
+app.get('/billing/price_check', async (_req, res) => {
+  try {
+    const p = await stripe.prices.retrieve(STRIPE_PRICE_PREMIUM);
+    res.json({
+      id: p.id,
+      active: p.active,
+      currency: p.currency,
+      type: p.type,
+      recurring: p.recurring || null,
+      product: typeof p.product === 'string' ? p.product : p.product?.id
+    });
+  } catch (e) {
+    console.error('[price_check] error:', e?.message);
+    res.status(500).json({ error: e?.message || 'price check failed' });
+  }
+});
+
+app.get('/billing/success', (_req, res) => res.send('Payment success\nYou can close this tab.'));
+app.get('/billing/cancel',  (_req, res) => res.send('Payment canceled'));
 
 // ---------- Stripe webhooks ----------
-// NOTE: We rely on req.rawBody set by the global express.json { verify } above.
 app.post('/webhooks/stripe', async (req, res) => {
   let event;
   try {
@@ -411,7 +405,7 @@ app.post('/webhooks/stripe', async (req, res) => {
     const raw = req.rawBody;
     event = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    log('[webhook] signature error:', err.message);
+    console.error('[webhook] signature error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
@@ -422,23 +416,17 @@ app.post('/webhooks/stripe', async (req, res) => {
         const email = s.customer_details?.email || s.customer_email;
         if (!email) break;
 
-        // Ensure user exists
+        // Ensure user
         let user = await prisma.user.findUnique({ where: { email } });
-        if (!user) {
-          user = await prisma.user.create({ data: { email } });
-          log('[webhook] created user:', email);
-        }
+        if (!user) user = await prisma.user.create({ data: { email } });
 
-        // Send registration email if password not set
+        // Registration email if needed
         if (!user.passwordHash) {
-          const raw = await issueRegistrationToken(user.id);
-          await sendRegistrationEmail(email, raw);
-          log('[webhook] sent registration email:', email);
-        } else {
-          log('[webhook] user already has a password; no email sent');
+          const rawTok = await issueRegistrationToken(user.id);
+          await sendRegistrationEmail(email, rawTok);
         }
 
-        // Ensure Org + Member, then upsert Subscription (if present)
+        // Ensure org/member + subscription
         const customerId = s.customer;
         if (customerId) {
           const cust = await getStripeCustomer(customerId);
@@ -465,7 +453,6 @@ app.post('/webhooks/stripe', async (req, res) => {
         const cust = await getStripeCustomer(customerId);
         const email = cust?.email;
 
-        // user may not exist yet (guest checkout)
         let user = email ? await prisma.user.findUnique({ where: { email } }) : null;
         if (!user && email) user = await prisma.user.create({ data: { email } });
 
@@ -481,16 +468,15 @@ app.post('/webhooks/stripe', async (req, res) => {
       }
 
       case 'invoice.payment_succeeded':
-      case 'invoice.payment_failed': {
-        // Optional: could refresh Subscription from sub id on the invoice.
+      case 'invoice.payment_failed':
+        // Optional: refresh subscription via invoice.subscription
         break;
-      }
 
       default:
         break;
     }
   } catch (e) {
-    log('[webhook] handler error:', e);
+    console.error('[webhook] handler error:', e);
   }
 
   res.json({ received: true });
