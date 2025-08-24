@@ -22,7 +22,7 @@ const {
   SMTP_SECURE,
   SMTP_USER,
   SMTP_PASS,
-  REG_URL_BASE, // e.g. https://www.nerdherdmc.net/account/set-password
+  REG_URL_BASE, // e.g. https://www.nerdherdmc.net/set-password
   PORT = 10000,
   NODE_ENV = 'production',
 } = process.env;
@@ -39,11 +39,10 @@ app.set('trust proxy', 1); // behind Render; silences rate-limit warning re: x-f
 const prisma = new PrismaClient();
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 
-// health check uses json
+// Health is plain
 app.use('/health', (req, res, next) => next());
-app.use(express.json());
 
-// permissive CORS to allowed origins
+// CORS
 const allowed = (CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -59,7 +58,7 @@ app.use(
   })
 );
 
-// rate limit (skip health & webhooks to avoid signature/body issues)
+// Rate‑limit (skip health & webhooks)
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 120,
@@ -88,7 +87,7 @@ function auth(req, res, next) {
   }
 }
 
-// SMTP transporter
+// --- SMTP transporter ---
 let transporter = null;
 (async () => {
   if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
@@ -98,12 +97,8 @@ let transporter = null;
       secure: String(SMTP_SECURE || 'true') === 'true',
       auth: { user: SMTP_USER, pass: SMTP_PASS },
     });
-    try {
-      await transporter.verify();
-      log('[mail] transporter verified: true');
-    } catch (e) {
-      log('[mail] transporter verify failed:', e?.message);
-    }
+    try { await transporter.verify(); log('[mail] transporter verified: true'); }
+    catch (e) { log('[mail] transporter verify failed:', e?.message); }
   } else {
     log('[mail] SMTP_* env not fully configured; email will be disabled.');
   }
@@ -121,12 +116,7 @@ async function issueRegistrationToken(userId) {
 }
 
 async function sendRegistrationEmail(email, rawToken) {
-  if (!transporter) {
-    log('[mail] transporter missing, cannot send');
-    return;
-  }
-  // Build link (you set REG_URL_BASE to your Wix page root OR full path)
-  // Accept either ".../account/set-password" or full URL including path.
+  if (!transporter) { log('[mail] transporter missing, cannot send'); return; }
   const base = (REG_URL_BASE || '').replace(/\/+$/, '');
   const url = `${base}?token=${encodeURIComponent(rawToken)}&email=${encodeURIComponent(email)}`;
   const info = await transporter.sendMail({
@@ -136,6 +126,72 @@ async function sendRegistrationEmail(email, rawToken) {
     html: `<p>Click to set your password:</p><p><a href="${url}">${url}</a></p>`,
   });
   log('[mail] sent:', email, 'messageId:', info.messageId);
+}
+
+// ---------- Stripe raw body handling ----------
+// Keep global JSON parsing, but preserve the raw payload for Stripe signature verification.
+app.use(express.json({
+  verify: (req, _res, buf) => {
+    if (req.originalUrl === '/webhooks/stripe') {
+      // @ts-ignore
+      req.rawBody = buf; // Buffer
+    }
+  }
+}));
+
+// ---------- Org / Member / Subscription helpers ----------
+
+function isPremium(status, end) {
+  const s = String(status || '').toLowerCase();
+  return (s === 'active' || s === 'trialing') && end instanceof Date && end.getTime() > Date.now();
+}
+
+async function ensureOrgAndMember({ userId, customerId, customerName, email }) {
+  // Find or create Org by Stripe customer
+  let org = await prisma.org.findFirst({ where: { stripeCustomerId: customerId } });
+  if (!org) {
+    const fallbackName = customerName || (email ? `${email.split('@')[0]}'s Org` : 'Account');
+    org = await prisma.org.create({
+      data: { name: fallbackName, stripeCustomerId: customerId, ownerUserId: userId || null }
+    });
+  }
+
+  // Ensure membership (owner if first)
+  if (userId) {
+    try {
+      await prisma.member.upsert({
+        where: { orgId_userId: { orgId: org.id, userId } },
+        update: {},
+        create: { orgId: org.id, userId, role: 'owner' }
+      });
+    } catch {
+      const exists = await prisma.member.findFirst({ where: { orgId: org.id, userId } });
+      if (!exists) await prisma.member.create({ data: { orgId: org.id, userId, role: 'owner' } });
+    }
+  }
+  return org;
+}
+
+async function upsertSubscription({ orgId, sub }) {
+  const end = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+  const id = `stripe_${sub.id}`;
+  await prisma.subscription.upsert({
+    where: { id },
+    create: {
+      id,
+      orgId,
+      provider: 'stripe',        // ignore if your schema doesn’t have this field
+      status: sub.status,
+      currentPeriodEnd: end,
+      customerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id
+    },
+    update: { status: sub.status, currentPeriodEnd: end }
+  });
+}
+
+async function getStripeCustomer(customerId) {
+  try { return await stripe.customers.retrieve(customerId); }
+  catch { return null; }
 }
 
 // ---------- public endpoints ----------
@@ -206,19 +262,39 @@ app.post('/auth/register/resend', async (req, res) => {
   res.json({ ok: true });
 });
 
-// Entitlements (compat) + account/me (same payload)
+// ---------- Entitlements (user + orgs + premium) ----------
 async function getEntitlementsPayload(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
-  const orgs = await prisma.org.findMany({
+
+  const orgsRaw = await prisma.org.findMany({
     where: {
       OR: [
         { ownerUserId: userId },
         { members: { some: { userId } } },
       ],
     },
-    select: { id: true, name: true },
+    select: {
+      id: true, name: true,
+      subscriptions: {
+        orderBy: { updatedAt: 'desc' },
+        take: 1,
+        select: { status: true, currentPeriodEnd: true }
+      }
+    },
   });
-  // If you store subscription at org-level, you can enrich here
+
+  const orgs = orgsRaw.map(o => {
+    const sub = o.subscriptions[0];
+    const premium = sub ? isPremium(sub.status, sub.currentPeriodEnd) : false;
+    return {
+      id: o.id,
+      name: o.name,
+      premium,
+      status: sub?.status || 'none',
+      currentPeriodEnd: sub?.currentPeriodEnd ? sub.currentPeriodEnd.toISOString() : null,
+    };
+  });
+
   return { user: { id: user.id, email: user.email }, orgs };
 }
 
@@ -231,7 +307,7 @@ app.get('/entitlements', auth, async (req, res) => {
   res.json(payload);
 });
 
-// Public checkout session (for testing from PS)
+// ---------- Public checkout (Wix -> backend -> Stripe) ----------
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
@@ -257,11 +333,14 @@ app.get('/billing/success', (req, res) => res.send('Payment success\nYou can clo
 app.get('/billing/cancel', (req, res) => res.send('Payment canceled'));
 
 // ---------- Stripe webhooks ----------
-app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+// NOTE: We rely on req.rawBody set by the global express.json { verify } above.
+app.post('/webhooks/stripe', async (req, res) => {
   let event;
   try {
     const sig = req.headers['stripe-signature'];
-    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+    // @ts-ignore
+    const raw = req.rawBody;
+    event = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     log('[webhook] signature error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
@@ -274,12 +353,14 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         const email = s.customer_details?.email || s.customer_email;
         if (!email) break;
 
+        // Ensure user exists
         let user = await prisma.user.findUnique({ where: { email } });
         if (!user) {
           user = await prisma.user.create({ data: { email } });
           log('[webhook] created user:', email);
         }
 
+        // Send registration email if password not set
         if (!user.passwordHash) {
           const raw = await issueRegistrationToken(user.id);
           await sendRegistrationEmail(email, raw);
@@ -287,38 +368,56 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         } else {
           log('[webhook] user already has a password; no email sent');
         }
-        break;
-      }
 
-      case 'customer.subscription.updated': {
-        // On renewals, do nothing. If user somehow has no password, you may re-send:
-        const sub = event.data.object;
-        const customerId = sub.customer;
-        const cust = await stripe.customers.retrieve(customerId);
-        const email = cust?.email;
-        if (!email) break;
-        const user = await prisma.user.findUnique({ where: { email } });
-        if (!user) break;
-        if (!user.passwordHash) {
-          // Only if never completed registration
-          const raw = await issueRegistrationToken(user.id);
-          await sendRegistrationEmail(email, raw);
-          log('[webhook] re-sent registration email (no password yet):', email);
+        // Ensure Org + Member, then upsert Subscription (if present)
+        const customerId = s.customer;
+        if (customerId) {
+          const cust = await getStripeCustomer(customerId);
+          const org = await ensureOrgAndMember({
+            userId: user.id, customerId, customerName: cust?.name, email
+          });
+
+          if (s.subscription) {
+            const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription.id;
+            const sub = await stripe.subscriptions.retrieve(subId);
+            await upsertSubscription({ orgId: org.id, sub });
+          }
         }
         break;
       }
 
-      case 'invoice.payment_succeeded': {
-        // no-op; subscription still active
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+        const customerId = sub.customer;
+        if (!customerId) break;
+
+        const cust = await getStripeCustomer(customerId);
+        const email = cust?.email;
+
+        // user may not exist yet (guest checkout)
+        let user = email ? await prisma.user.findUnique({ where: { email } }) : null;
+        if (!user && email) user = await prisma.user.create({ data: { email } });
+
+        const org = await ensureOrgAndMember({
+          userId: user?.id ?? undefined,
+          customerId,
+          customerName: cust?.name,
+          email
+        });
+
+        await upsertSubscription({ orgId: org.id, sub });
         break;
       }
 
+      case 'invoice.payment_succeeded':
       case 'invoice.payment_failed': {
-        // You can email here if you want to notify about failed renewal.
+        // Optional: could refresh Subscription from sub id on the invoice.
         break;
       }
+
       default:
-        // ignore others
         break;
     }
   } catch (e) {
@@ -326,15 +425,6 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
   }
 
   res.json({ received: true });
-});
-
-// Stripe needs the raw body; add JSON parser back for all other routes after webhooks
-app.use((req, res, next) => {
-  if (req.headers['content-type']?.startsWith('application/json') && !req.body) {
-    express.json()(req, res, next);
-  } else {
-    next();
-  }
 });
 
 // ---------- start ----------
