@@ -262,6 +262,75 @@ app.post('/auth/register/resend', async (req, res) => {
   res.json({ ok: true });
 });
 
+/* =======================
+   C) Forgot Password flow
+   ======================= */
+
+// Start reset: { email }
+app.post('/auth/reset/start', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+
+  const user = await prisma.user.findUnique({ where: { email } });
+
+  // Always return 200 to prevent user enumeration
+  if (!user) return res.json({ ok: true });
+
+  const raw = crypto.randomBytes(32).toString('hex');
+  const tokenHash = await bcrypt.hash(raw, 10);
+  const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24); // 24h
+
+  await prisma.passwordToken.create({
+    data: { userId: user.id, tokenHash, purpose: 'reset', expiresAt },
+  });
+
+  if (transporter) {
+    const base = (REG_URL_BASE || '').replace(/\/+$/, '');
+    const url = `${base}?token=${encodeURIComponent(raw)}&email=${encodeURIComponent(email)}&mode=reset`;
+    await transporter.sendMail({
+      from: SMTP_USER,
+      to: email,
+      subject: 'Reset your Bedrock Utilities password',
+      html: `<p>Click to reset your password:</p><p><a href="${url}">${url}</a></p>`,
+    });
+  } else {
+    log('[mail] reset requested but SMTP is not configured');
+  }
+
+  res.json({ ok: true });
+});
+
+// Complete reset: { email, token, newPassword }
+app.post('/auth/reset/complete', async (req, res) => {
+  const { email, token, newPassword } = req.body || {};
+  if (!email || !token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user) return res.status(400).json({ error: 'User not found' });
+
+  const tok = await prisma.passwordToken.findFirst({
+    where: {
+      userId: user.id,
+      purpose: 'reset',
+      usedAt: null,
+      expiresAt: { gt: new Date() },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (!tok) return res.status(400).json({ error: 'Token not found or expired' });
+
+  const ok = await bcrypt.compare(token, tok.tokenHash);
+  if (!ok) return res.status(400).json({ error: 'Invalid token' });
+
+  const hash = await bcrypt.hash(newPassword, 10);
+  await prisma.$transaction([
+    prisma.user.update({ where: { id: user.id }, data: { passwordHash: hash } }),
+    prisma.passwordToken.update({ where: { id: tok.id }, data: { usedAt: new Date() } }),
+  ]);
+
+  res.json({ ok: true });
+});
+
 // ---------- Entitlements (user + orgs + premium) ----------
 async function getEntitlementsPayload(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
