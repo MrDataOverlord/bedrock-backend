@@ -373,7 +373,7 @@ app.get('/entitlements', auth, async (req, res) => {
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 
-// ----- Checkout public (create Stripe Checkout session) -----
+// POST /billing/checkout_public
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
@@ -384,11 +384,10 @@ app.post('/billing/checkout_public', async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_creation: 'always',
-      customer_email: email,
+      customer_email: email,   // Stripe will auto-create a customer if one doesn't exist
       line_items: [
         {
-          price: process.env.STRIPE_PRICE_PREMIUM, // recurring price ID from Stripe
+          price: process.env.STRIPE_PRICE_PREMIUM, // must be a valid recurring price ID
           quantity: 1,
         },
       ],
@@ -403,6 +402,7 @@ app.post('/billing/checkout_public', async (req, res) => {
     return res.status(500).json({ error: 'Checkout failed' });
   }
 });
+
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
