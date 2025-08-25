@@ -35,21 +35,20 @@ model User {
 }
 
 model Org {
-  id             String   @id @default(cuid())
-  ownerUserId    String?                // ← make optional (webhook may create org first)
-  name           String   @default("My Org")
-  createdAt      DateTime @default(now())
+  id               String   @id @default(cuid())
+  ownerUserId      String?                    // was String
+  name             String   @default("My Org")
+  createdAt        DateTime @default(now())
 
-  // NEW: required by server.js (used in ensureOrgAndMember & lookups)
-  stripeCustomerId String? @unique
+  stripeCustomerId String?  @unique           // NEW
 
-  // Relations
   owner         User?          @relation(fields: [ownerUserId], references: [id])
   members       Member[]
   subscriptions Subscription[]
 
   @@index([ownerUserId])
 }
+
 
 model Member {
   id        String   @id @default(cuid())
