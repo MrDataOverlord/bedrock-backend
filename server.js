@@ -103,7 +103,19 @@ let transporter = null;
   }
 })();
 
+// ---------- one-time token helpers ----------
+async function invalidateTokensFor(userId, purpose) {
+  // Mark any existing, still-unused tokens as used (effectively revoking them)
+  await prisma.passwordToken.updateMany({
+    where: { userId, purpose, usedAt: null },
+    data:  { usedAt: new Date() }
+  });
+}
+
 async function issueRegistrationToken(userId) {
+  // NEW: revoke any previous unused registration tokens
+  await invalidateTokensFor(userId, 'register');
+
   const raw = crypto.randomBytes(32).toString('hex');
   const tokenHash = await bcrypt.hash(raw, 10);
   const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24); // 24h
@@ -214,7 +226,6 @@ app.post('/auth/register/complete', async (req, res) => {
   const { token, password } = req.body || {};
   if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
 
-  // Locate the most recent unused, unexpired "register" token
   const tok = await prisma.passwordToken.findFirst({
     where: { purpose: 'register', usedAt: null, expiresAt: { gt: new Date() } },
     orderBy: { createdAt: 'desc' },
@@ -246,6 +257,7 @@ app.post('/auth/register/resend', async (req, res) => {
   if (!user) return res.status(200).json({ ok: true }); // avoid enumeration
   if (user.passwordHash) return res.status(200).json({ ok: true, note: 'already_has_password' });
 
+  // NEW: revoke any previous unused registration tokens before issuing a new one
   const raw = await issueRegistrationToken(user.id);
   await sendRegistrationEmail(user.email, raw);
   res.json({ ok: true });
@@ -263,6 +275,9 @@ app.post('/auth/reset/start', async (req, res) => {
 
   const user = await prisma.user.findUnique({ where: { email } });
   if (!user) return res.json({ ok: true }); // don’t reveal
+
+  // NEW: revoke any previous unused reset tokens before issuing a new one
+  await invalidateTokensFor(user.id, 'reset');
 
   const raw = crypto.randomBytes(32).toString('hex');
   const tokenHash = await bcrypt.hash(raw, 10);
@@ -301,12 +316,9 @@ app.post('/auth/reset/complete', async (req, res) => {
   const ok = await bcrypt.compare(token, tok.tokenHash);
   if (!ok) return res.status(400).json({ error: 'Invalid token' });
 
-  const user = await prisma.user.findUnique({ where: { id: tok.userId } });
-  if (!user) return res.status(400).json({ error: 'User not found' });
-
   const hash = await bcrypt.hash(newPassword, 10);
   await prisma.$transaction([
-    prisma.user.update({ where: { id: user.id }, data: { passwordHash: hash } }),
+    prisma.user.update({ where: { id: tok.userId }, data: { passwordHash: hash } }),
     prisma.passwordToken.update({ where: { id: tok.id }, data: { usedAt: new Date() } }),
   ]);
 
@@ -425,9 +437,9 @@ app.post('/webhooks/stripe', async (req, res) => {
         let user = await prisma.user.findUnique({ where: { email } });
         if (!user) user = await prisma.user.create({ data: { email } });
 
-        // Registration email if needed
+        // Registration email if needed, with one-time token behavior
         if (!user.passwordHash) {
-          const rawTok = await issueRegistrationToken(user.id);
+          const rawTok = await issueRegistrationToken(user.id); // revokes prior tokens
           await sendRegistrationEmail(email, rawTok);
         }
 
@@ -439,11 +451,11 @@ app.post('/webhooks/stripe', async (req, res) => {
             userId: user.id, customerId, customerName: cust?.name, email
           });
 
-            if (s.subscription) {
-              const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription.id;
-              const sub = await stripe.subscriptions.retrieve(subId);
-              await upsertSubscription({ orgId: org.id, sub });
-            }
+          if (s.subscription) {
+            const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription.id;
+            const sub = await stripe.subscriptions.retrieve(subId);
+            await upsertSubscription({ orgId: org.id, sub });
+          }
         }
         break;
       }
