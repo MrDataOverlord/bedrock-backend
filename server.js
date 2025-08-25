@@ -151,26 +151,33 @@ function isPremium(status, end) {
 }
 
 async function ensureOrgAndMember({ userId, customerId, customerName, email }) {
+  // Find org that belongs to this Stripe customer
   let org = await prisma.org.findFirst({ where: { stripeCustomerId: customerId } });
+
   if (!org) {
     const fallbackName = customerName || (email ? `${email.split('@')[0]}'s Org` : 'Account');
     org = await prisma.org.create({
       data: { name: fallbackName, stripeCustomerId: customerId, ownerUserId: userId || null }
     });
+  } else {
+    // 🔧 Repair path: if org exists but has no owner, attach the current user as owner
+    if (userId && !org.ownerUserId) {
+      org = await prisma.org.update({
+        where: { id: org.id },
+        data: { ownerUserId: userId }
+      });
+    }
   }
 
   if (userId) {
-    try {
-      await prisma.member.upsert({
-        where: { orgId_userId: { orgId: org.id, userId } },
-        update: {},
-        create: { orgId: org.id, userId, role: 'owner' }
-      });
-    } catch {
-      const exists = await prisma.member.findFirst({ where: { orgId: org.id, userId } });
-      if (!exists) await prisma.member.create({ data: { orgId: org.id, userId, role: 'owner' } });
-    }
+    // Always ensure there is a membership row for this user↔org
+    await prisma.member.upsert({
+      where: { orgId_userId: { orgId: org.id, userId } }, // relies on @@unique([orgId, userId]) in schema
+      update: {},
+      create: { orgId: org.id, userId, role: 'owner' }
+    });
   }
+
   return org;
 }
 
@@ -189,11 +196,6 @@ async function upsertSubscription({ orgId, sub }) {
     },
     update: { status: sub.status, currentPeriodEnd: end }
   });
-}
-
-async function getStripeCustomer(customerId) {
-  try { return await stripe.customers.retrieve(customerId); }
-  catch { return null; }
 }
 
 // ---------- public endpoints ----------
