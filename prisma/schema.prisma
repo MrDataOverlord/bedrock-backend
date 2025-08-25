@@ -1,4 +1,3 @@
-// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,7 +7,9 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-/* ======================= Core ======================= */
+// =======================
+// Core
+// =======================
 
 model Device {
   id        String   @id @default(cuid())
@@ -26,7 +27,6 @@ model User {
   totpSecret    String?
   createdAt     DateTime @default(now())
 
-  // Relations
   ownedOrgs      Org[]
   memberships    Member[]
   passwordTokens PasswordToken[]
@@ -34,11 +34,12 @@ model User {
 
 model Org {
   id               String   @id @default(cuid())
-  ownerUserId      String?                    // was String
+  ownerUserId      String?          // optional so webhooks can create org first
   name             String   @default("My Org")
   createdAt        DateTime @default(now())
 
-  stripeCustomerId String?  @unique           // NEW
+  // Required by server.js to link Stripe customer to this org
+  stripeCustomerId String?  @unique
 
   owner         User?          @relation(fields: [ownerUserId], references: [id])
   members       Member[]
@@ -46,7 +47,6 @@ model Org {
 
   @@index([ownerUserId])
 }
-
 
 model Member {
   id        String   @id @default(cuid())
@@ -58,36 +58,38 @@ model Member {
   org  Org  @relation(fields: [orgId], references: [id])
   user User @relation(fields: [userId], references: [id])
 
-  // Server upserts via where: { orgId_userId: { orgId, userId } }
+  // used by server.js upsert(where: { orgId_userId: { ... } })
   @@unique([orgId, userId], name: "orgId_userId")
   @@index([orgId])
   @@index([userId])
 }
 
-/* ======================= Password / Registration ======================= */
+// =======================
+// Password / Registration
+// =======================
 
 model PasswordToken {
   id        String    @id @default(cuid())
   userId    String
-  purpose   String    // 'register' | 'reset'
-  tokenHash String    @unique
+  purpose   String      // 'register' | 'reset'
+  tokenHash String      @unique
   expiresAt DateTime
   usedAt    DateTime?
-  createdAt DateTime  @default(now())
+  createdAt DateTime    @default(now())
 
   user User @relation(fields: [userId], references: [id])
 
   @@index([userId])
 }
 
-/* =======================
-   Billing
-======================= */
+// =======================
+// Billing
+// =======================
 
 model Subscription {
-  id               String    @id        // stores "stripe_<subId>" from server.js
+  id               String    @id                // we store "stripe_<subId>"
   orgId            String
-  provider         String                 // set to "stripe" in server.js
+  provider         String                         // "stripe"
   status           String
   currentPeriodEnd DateTime?
   customerId       String?
