@@ -373,29 +373,45 @@ app.get('/entitlements', auth, async (req, res) => {
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 
-// ----- Public checkout -----
+// ----- POST /billing/checkout_public -----
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
-    if (!email) return res.status(400).json({ error: 'Missing email' });
+    if (!email) return res.status(400).json({ error: 'email required' });
+
+    const successUrl = (returnUrl && String(returnUrl)) || 'https://www.nerdherdmc.net/new-account';
+    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
+      customer_creation: 'always',
       customer_email: email,
-      success_url: returnUrl || 'https://bedrock-backend-ipj6.onrender.com/billing/success',
-      cancel_url:  returnUrl || 'https://bedrock-backend-ipj6.onrender.com/billing/cancel',
-      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      line_items: [
+        { price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }
+      ],
+
+      // 1) Classic success/cancel for safety + deep-link to the session
+      success_url: `${successUrl}?cs={CHECKOUT_SESSION_ID}`,
+      cancel_url:  cancelUrl,
+
+      // 2) New way: auto-redirect off the hosted confirmation page
+      ui_mode: 'hosted',
+      after_completion: {
+        type: 'redirect',
+        redirect: { url: successUrl }
+      },
+
       allow_promotion_codes: true,
+      // automatic_tax: { enabled: false }, // (leave as-is if you’re not using it)
     });
 
-    res.json({ url: session.url, id: session.id });
+    return res.json({ url: session.url });
   } catch (e) {
-    const msg  = e?.raw?.message || e?.message || 'Checkout failed';
-    const code = e?.code || e?.raw?.code || e?.type;
-    console.error('[checkout_public] error:', { code, msg });
-    res.status(500).json({ error: 'Checkout failed', detail: msg, code });
+    console.error('[checkout_public] error:', e);
+    return res.status(500).json({ error: 'Checkout failed' });
   }
 });
+
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
