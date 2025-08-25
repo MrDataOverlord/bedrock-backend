@@ -373,7 +373,7 @@ app.get('/entitlements', auth, async (req, res) => {
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 
-// POST /billing/checkout_public
+// ----- Checkout public (create Stripe Checkout session) -----
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
@@ -383,20 +383,26 @@ app.post('/billing/checkout_public', async (req, res) => {
     const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
     const session = await stripe.checkout.sessions.create({
-  mode: 'subscription',
-  customer_creation: 'always',
-  customer_email: email,
-  line_items: [
-    { price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }
-  ],
+      mode: 'subscription',
+      customer_creation: 'always',
+      customer_email: email,
+      line_items: [
+        {
+          price: process.env.STRIPE_PRICE_PREMIUM, // recurring price ID from Stripe
+          quantity: 1,
+        },
+      ],
+      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl,
+      allow_promotion_codes: true,
+    });
 
-  // Standard redirect URLs
-  success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-  cancel_url: cancelUrl,
-
-  allow_promotion_codes: true,
+    return res.json({ url: session.url });
+  } catch (e) {
+    console.error('[checkout_public] error:', e);
+    return res.status(500).json({ error: 'Checkout failed' });
+  }
 });
-
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
