@@ -1,3 +1,4 @@
+// prisma/schema.prisma
 generator client {
   provider = "prisma-client-js"
 }
@@ -7,7 +8,9 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Core
+/* =======================
+   Core
+======================= */
 
 model Device {
   id        String   @id @default(cuid())
@@ -19,24 +22,29 @@ model Device {
 }
 
 model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  passwordHash String?
-  totpSecret   String?
-  createdAt    DateTime @default(now())
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String?
+  totpSecret    String?
+  createdAt     DateTime @default(now())
 
+  // Relations
   ownedOrgs      Org[]
   memberships    Member[]
   passwordTokens PasswordToken[]
 }
 
 model Org {
-  id          String   @id @default(cuid())
-  ownerUserId String
-  name        String   @default("My Org")
-  createdAt   DateTime @default(now())
+  id             String   @id @default(cuid())
+  ownerUserId    String?                // ← make optional (webhook may create org first)
+  name           String   @default("My Org")
+  createdAt      DateTime @default(now())
 
-  owner         User           @relation(fields: [ownerUserId], references: [id])
+  // NEW: required by server.js (used in ensureOrgAndMember & lookups)
+  stripeCustomerId String? @unique
+
+  // Relations
+  owner         User?          @relation(fields: [ownerUserId], references: [id])
   members       Member[]
   subscriptions Subscription[]
 
@@ -53,17 +61,20 @@ model Member {
   org  Org  @relation(fields: [orgId], references: [id])
   user User @relation(fields: [userId], references: [id])
 
-  @@unique([orgId, userId])
+  // Server upserts via where: { orgId_userId: { orgId, userId } }
+  @@unique([orgId, userId], name: "orgId_userId")
   @@index([orgId])
   @@index([userId])
 }
 
-// Password / Registration
+/* =======================
+   Password / Registration
+======================= */
 
 model PasswordToken {
   id        String    @id @default(cuid())
   userId    String
-  purpose   String
+  purpose   String    // 'register' | 'reset'
   tokenHash String    @unique
   expiresAt DateTime
   usedAt    DateTime?
@@ -71,15 +82,17 @@ model PasswordToken {
 
   user User @relation(fields: [userId], references: [id])
 
-  @@index([userId]) // ✅ model-level index
+  @@index([userId])
 }
 
-// Billing
+/* =======================
+   Billing
+======================= */
 
 model Subscription {
-  id               String    @id // store "stripe_<subId>"
+  id               String    @id        // stores "stripe_<subId>" from server.js
   orgId            String
-  provider         String
+  provider         String                 // set to "stripe" in server.js
   status           String
   currentPeriodEnd DateTime?
   customerId       String?
