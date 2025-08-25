@@ -206,23 +206,27 @@ app.post('/auth/login', async (req, res) => {
   res.json({ access: signAccess(user) });
 });
 
-// Auth: complete registration (from emailed token)
+/* =========================
+   Registration completion
+   (token-anchored, email-agnostic)
+   ========================= */
 app.post('/auth/register/complete', async (req, res) => {
-  const { email, token, password } = req.body || {};
-  if (!email || !token || !password) return res.status(400).json({ error: 'Missing fields' });
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
 
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) return res.status(400).json({ error: 'User not found' });
-  if (user.passwordHash) return res.status(400).json({ error: 'Password already set' });
-
+  // Locate the most recent unused, unexpired "register" token
   const tok = await prisma.passwordToken.findFirst({
-    where: { userId: user.id, purpose: 'register', usedAt: null, expiresAt: { gt: new Date() } },
+    where: { purpose: 'register', usedAt: null, expiresAt: { gt: new Date() } },
     orderBy: { createdAt: 'desc' },
   });
   if (!tok) return res.status(400).json({ error: 'Token not found or expired' });
 
   const ok = await bcrypt.compare(token, tok.tokenHash);
   if (!ok) return res.status(400).json({ error: 'Invalid token' });
+
+  const user = await prisma.user.findUnique({ where: { id: tok.userId } });
+  if (!user) return res.status(400).json({ error: 'User not found' });
+  if (user.passwordHash) return res.status(400).json({ error: 'Password already set' });
 
   const hash = await bcrypt.hash(password, 10);
   await prisma.$transaction([
@@ -248,7 +252,8 @@ app.post('/auth/register/resend', async (req, res) => {
 });
 
 /* =======================
-   C) Forgot Password flow
+   Forgot Password flow
+   (token-anchored, email-agnostic completion)
    ======================= */
 
 // Start reset
@@ -284,20 +289,20 @@ app.post('/auth/reset/start', async (req, res) => {
 
 // Complete reset
 app.post('/auth/reset/complete', async (req, res) => {
-  const { email, token, newPassword } = req.body || {};
-  if (!email || !token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
-
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) return res.status(400).json({ error: 'User not found' });
+  const { token, newPassword } = req.body || {};
+  if (!token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
 
   const tok = await prisma.passwordToken.findFirst({
-    where: { userId: user.id, purpose: 'reset', usedAt: null, expiresAt: { gt: new Date() } },
+    where: { purpose: 'reset', usedAt: null, expiresAt: { gt: new Date() } },
     orderBy: { createdAt: 'desc' },
   });
   if (!tok) return res.status(400).json({ error: 'Token not found or expired' });
 
   const ok = await bcrypt.compare(token, tok.tokenHash);
   if (!ok) return res.status(400).json({ error: 'Invalid token' });
+
+  const user = await prisma.user.findUnique({ where: { id: tok.userId } });
+  if (!user) return res.status(400).json({ error: 'User not found' });
 
   const hash = await bcrypt.hash(newPassword, 10);
   await prisma.$transaction([
@@ -434,11 +439,11 @@ app.post('/webhooks/stripe', async (req, res) => {
             userId: user.id, customerId, customerName: cust?.name, email
           });
 
-          if (s.subscription) {
-            const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription.id;
-            const sub = await stripe.subscriptions.retrieve(subId);
-            await upsertSubscription({ orgId: org.id, sub });
-          }
+            if (s.subscription) {
+              const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription.id;
+              const sub = await stripe.subscriptions.retrieve(subId);
+              await upsertSubscription({ orgId: org.id, sub });
+            }
         }
         break;
       }
@@ -469,7 +474,7 @@ app.post('/webhooks/stripe', async (req, res) => {
 
       case 'invoice.payment_succeeded':
       case 'invoice.payment_failed':
-        // Optional: refresh subscription via invoice.subscription
+        // Optional: refresh from invoice.subscription if desired
         break;
 
       default:
