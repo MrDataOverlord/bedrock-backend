@@ -334,7 +334,8 @@ app.post('/auth/reset/complete', async (req, res) => {
 async function getEntitlementsPayload(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
 
-  const orgsRaw = await prisma.org.findMany({
+  // current read
+  let orgsRaw = await prisma.org.findMany({
     where: {
       OR: [
         { ownerUserId: userId },
@@ -351,6 +352,50 @@ async function getEntitlementsPayload(userId) {
     },
   });
 
+  // --- NEW: self-heal if the user has no orgs but Stripe has a customer for their email ---
+  if (!orgsRaw.length && user?.email) {
+    try {
+      const list = await stripe.customers.list({ email: user.email, limit: 1 });
+      const cust = list.data?.[0];
+      if (cust?.id) {
+        // create/link an org, and upsert the active sub if present
+        const org = await ensureOrgAndMember({
+          userId,
+          customerId: cust.id,
+          customerName: cust.name,
+          email: user.email
+        });
+
+        // If a subscription exists, upsert it too (best-effort)
+        if (cust.subscriptions?.data?.length) {
+          const activeSub = cust.subscriptions.data[0];
+          await upsertSubscription({ orgId: org.id, sub: activeSub });
+        }
+
+        // re-read orgs after linking
+        orgsRaw = await prisma.org.findMany({
+          where: {
+            OR: [
+              { ownerUserId: userId },
+              { members: { some: { userId } } },
+            ],
+          },
+          select: {
+            id: true, name: true,
+            subscriptions: {
+              orderBy: { updatedAt: 'desc' },
+              take: 1,
+              select: { status: true, currentPeriodEnd: true }
+            }
+          },
+        });
+      }
+    } catch (e) {
+      console.error('[entitlements self-heal] failed:', e?.message || e);
+    }
+  }
+  // --- END NEW ---
+
   const orgs = orgsRaw.map(o => {
     const sub = o.subscriptions[0];
     const premium = sub ? isPremium(sub.status, sub.currentPeriodEnd) : false;
@@ -365,6 +410,7 @@ async function getEntitlementsPayload(userId) {
 
   return { user: { id: user.id, email: user.email }, orgs };
 }
+
 
 app.get('/account/me', auth, async (req, res) => {
   res.json(await getEntitlementsPayload(req.user.sub));
