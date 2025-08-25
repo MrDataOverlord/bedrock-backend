@@ -383,27 +383,27 @@ app.post('/billing/checkout_public', async (req, res) => {
     const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
     const session = await stripe.checkout.sessions.create({
-  mode: 'subscription',
-  customer_creation: 'always',
-  customer_email: email,
-  line_items: [
-    {
-      price: process.env.STRIPE_PRICE_PREMIUM, // must be a valid recurring Price ID
-      quantity: 1,
-    },
-  ],
-  success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-  cancel_url: cancelUrl,
-  allow_promotion_codes: true,
-});
-
+      mode: 'subscription',
+      customer_creation: 'always',
+      customer_email: email,
+      line_items: [
+        {
+          price: process.env.STRIPE_PRICE_PREMIUM, // recurring Price ID
+          quantity: 1,
+        },
+      ],
+      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl,
+      allow_promotion_codes: true,
+    });
 
     return res.json({ url: session.url });
   } catch (e) {
     console.error('[checkout_public] error:', e);
-    return res.status(500).json({ error: 'Checkout failed' });
+    return res.status(500).json({ error: 'Checkout failed', detail: e.message });
   }
 });
+
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
