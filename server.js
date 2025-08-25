@@ -383,19 +383,20 @@ app.post('/billing/checkout_public', async (req, res) => {
     const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
     const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer_creation: 'always',
-      customer_email: email,
-      line_items: [
-        { price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }
-      ],
+  mode: 'subscription',
+  customer_creation: 'always',
+  customer_email: email,
+  line_items: [
+    {
+      price: process.env.STRIPE_PRICE_PREMIUM, // must be a valid recurring Price ID
+      quantity: 1,
+    },
+  ],
+  success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+  cancel_url: cancelUrl,
+  allow_promotion_codes: true,
+});
 
-      // ✅ Only these two now
-      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: cancelUrl,
-
-      allow_promotion_codes: true,
-    });
 
     return res.json({ url: session.url });
   } catch (e) {
