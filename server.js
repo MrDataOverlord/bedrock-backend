@@ -390,9 +390,9 @@ app.post('/billing/checkout_public', async (req, res) => {
         { price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }
       ],
 
-      // ✅ Only use success/cancel URLs now
+      // ✅ Only these two now
       success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  cancelUrl,
+      cancel_url: cancelUrl,
 
       allow_promotion_codes: true,
     });
@@ -403,8 +403,6 @@ app.post('/billing/checkout_public', async (req, res) => {
     return res.status(500).json({ error: 'Checkout failed' });
   }
 });
-
-
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
