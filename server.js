@@ -373,7 +373,7 @@ app.get('/entitlements', auth, async (req, res) => {
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 
-// ----- POST /billing/checkout_public -----
+// POST /billing/checkout_public
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
@@ -390,19 +390,11 @@ app.post('/billing/checkout_public', async (req, res) => {
         { price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }
       ],
 
-      // 1) Classic success/cancel for safety + deep-link to the session
-      success_url: `${successUrl}?cs={CHECKOUT_SESSION_ID}`,
+      // ✅ Only use success/cancel URLs now
+      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url:  cancelUrl,
 
-      // 2) New way: auto-redirect off the hosted confirmation page
-      ui_mode: 'hosted',
-      after_completion: {
-        type: 'redirect',
-        redirect: { url: successUrl }
-      },
-
       allow_promotion_codes: true,
-      // automatic_tax: { enabled: false }, // (leave as-is if you’re not using it)
     });
 
     return res.json({ url: session.url });
@@ -411,6 +403,7 @@ app.post('/billing/checkout_public', async (req, res) => {
     return res.status(500).json({ error: 'Checkout failed' });
   }
 });
+
 
 
 // ----- Price sanity check -----
