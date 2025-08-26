@@ -397,6 +397,26 @@ async function getEntitlementsPayload(userId) {
   return { user: { id: userId }, orgs };
 }
 
+// DEBUG: GET /__debug/entitlements?email=...&key=...
+app.get('/__debug/entitlements', async (req, res) => {
+  try {
+    if (process.env.DEBUG_KEY && req.query.key !== process.env.DEBUG_KEY) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    const email = String(req.query.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'missing email' });
+
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.status(404).json({ error: 'user not found' });
+
+    const payload = await getEntitlementsPayload(user.id);
+    res.json(payload);
+  } catch (e) {
+    console.error('[__debug/entitlements] error:', e);
+    res.status(500).json({ error: 'debug failed', detail: e?.message });
+  }
+});
+
 
 app.get('/account/me', auth, async (req, res) => {
   res.json(await getEntitlementsPayload(req.user.sub));
