@@ -134,6 +134,19 @@ async function sendRegistrationEmail(email, rawToken) {
   log('[mail] sent:', email, 'messageId:', info.messageId);
 }
 
+// --- add this helper back ---
+async function getStripeCustomer(customerId) {
+  try {
+    // You can expand subscriptions here if you want self-healing later:
+    // return await stripe.customers.retrieve(customerId, { expand: ['subscriptions.data'] });
+    return await stripe.customers.retrieve(customerId);
+  } catch (e) {
+    console.error('[getStripeCustomer] failed:', e?.message || e);
+    return null;
+  }
+}
+
+
 // ---------- Stripe raw-body ----------
 app.use(express.json({
   verify: (req, _res, buf) => {
