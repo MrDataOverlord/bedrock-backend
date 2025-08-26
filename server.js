@@ -149,33 +149,43 @@ function isPremium(status, end) {
   const s = String(status || '').toLowerCase();
   return (s === 'active' || s === 'trialing') && end instanceof Date && end.getTime() > Date.now();
 }
-
 async function ensureOrgAndMember({ userId, customerId, customerName, email }) {
-  // Find org that belongs to this Stripe customer
+  if (!customerId) throw new Error('ensureOrgAndMember: missing customerId');
+
+  // Find/create org by Stripe Customer
   let org = await prisma.org.findFirst({ where: { stripeCustomerId: customerId } });
 
   if (!org) {
-    const fallbackName = customerName || (email ? `${email.split('@')[0]}'s Org` : 'Account');
+    const fallbackName =
+      customerName || (email ? `${String(email).split('@')[0]}'s Org` : 'Account');
+
     org = await prisma.org.create({
-      data: { name: fallbackName, stripeCustomerId: customerId, ownerUserId: userId || null }
+      data: {
+        name: fallbackName,
+        stripeCustomerId: customerId,
+        // ownerUserId may be null here; we’ll fix just below if we have a userId
+        ownerUserId: userId ?? null,
+      },
     });
-  } else {
-    // 🔧 Repair path: if org exists but has no owner, attach the current user as owner
-    if (userId && !org.ownerUserId) {
-      org = await prisma.org.update({
-        where: { id: org.id },
-        data: { ownerUserId: userId }
-      });
-    }
+    console.log('[org] created', org.id, 'cust:', customerId);
+  } else if (userId && !org.ownerUserId) {
+    // Repair: latch owner if missing
+    org = await prisma.org.update({
+      where: { id: org.id },
+      data: { ownerUserId: userId },
+    });
+    console.log('[org] repaired owner', org.id, '->', userId);
   }
 
+  // If we know the user, be sure they’re a member
   if (userId) {
-    // Always ensure there is a membership row for this user↔org
+    // This relies on the composite unique on (orgId, userId) in your schema
     await prisma.member.upsert({
-      where: { orgId_userId: { orgId: org.id, userId } }, // relies on @@unique([orgId, userId]) in schema
+      where: { orgId_userId: { orgId: org.id, userId } },
       update: {},
-      create: { orgId: org.id, userId, role: 'owner' }
+      create: { orgId: org.id, userId, role: 'owner' },
     });
+    console.log('[member] ensured link user', userId, 'org', org.id);
   }
 
   return org;
