@@ -352,68 +352,39 @@ app.post('/auth/reset/complete', async (req, res) => {
 
   res.json({ ok: true });
 });
-
-// ----- Entitlements (with self-heal) -----
+// ----- Entitlements (robust) -----
 async function getEntitlementsPayload(userId) {
-  const user = await prisma.user.findUnique({ where: { id: userId } });
+  const now = new Date();
 
-  let orgsRaw = await prisma.org.findMany({
+  // Pull the orgs the user owns or belongs to, and *only* the subs that are truly active
+  const orgsRaw = await prisma.org.findMany({
     where: {
-      OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
+      OR: [
+        { ownerUserId: userId },
+        { members: { some: { userId } } },
+      ],
     },
     select: {
       id: true,
       name: true,
       subscriptions: {
-        orderBy: { updatedAt: 'desc' },
-        take: 1,
-        select: { status: true, currentPeriodEnd: true },
+        where: {
+          status: { in: ['active', 'trialing'] },
+          currentPeriodEnd: { gt: now },
+        },
+        orderBy: { currentPeriodEnd: 'desc' },
+        take: 1, // the best/farthest-valid one is enough
+        select: {
+          status: true,
+          currentPeriodEnd: true,
+        },
       },
     },
   });
 
-  // Self-heal: if the user exists but has no orgs, see if Stripe has a customer by email
-  if (!orgsRaw.length && user?.email) {
-    try {
-      const list = await stripe.customers.list({ email: user.email, limit: 1 });
-      const cust = list.data?.[0];
-      if (cust?.id) {
-        const org = await ensureOrgAndMember({
-          userId,
-          customerId: cust.id,
-          customerName: cust.name,
-          email: user.email,
-        });
-
-        if (cust.subscriptions?.data?.length) {
-          const activeSub = cust.subscriptions.data[0];
-          await upsertSubscription({ orgId: org.id, sub: activeSub });
-        }
-
-        // re-read
-        orgsRaw = await prisma.org.findMany({
-          where: {
-            OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-          },
-          select: {
-            id: true,
-            name: true,
-            subscriptions: {
-              orderBy: { updatedAt: 'desc' },
-              take: 1,
-              select: { status: true, currentPeriodEnd: true },
-            },
-          },
-        });
-      }
-    } catch (e) {
-      console.error('[entitlements self-heal] failed:', e?.message || e);
-    }
-  }
-
-  const orgs = orgsRaw.map((o) => {
-    const sub = o.subscriptions[0];
-    const premium = sub ? isPremium(sub.status, sub.currentPeriodEnd) : false;
+  const orgs = orgsRaw.map(o => {
+    const sub = o.subscriptions[0] || null;
+    const premium = !!sub; // by construction, sub implies active/trialing & future end
     return {
       id: o.id,
       name: o.name,
@@ -423,8 +394,9 @@ async function getEntitlementsPayload(userId) {
     };
   });
 
-  return { user: { id: user.id, email: user.email }, orgs };
+  return { user: { id: userId }, orgs };
 }
+
 
 app.get('/account/me', auth, async (req, res) => {
   res.json(await getEntitlementsPayload(req.user.sub));
