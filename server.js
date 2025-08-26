@@ -381,31 +381,48 @@ app.get('/entitlements', auth, async (req, res) => {
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 
-// ---------- Public checkout (client creates a session) ----------
+// POST /billing/checkout_public (safe: classic success/cancel URLs)
 app.post('/billing/checkout_public', async (req, res) => {
+  const { email, returnUrl } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'email required' });
+
+  // where you want the user to land after a successful checkout
+  const successBase = (returnUrl && String(returnUrl)) || 'https://www.nerdherdmc.net/new-account';
+  const cancelUrl   = 'https://www.nerdherdmc.net/accounts';
+
   try {
-    const { email, returnUrl } = req.body || {};
-    if (!email) return res.status(400).json({ error: 'email required' });
-
-    const successUrl = (returnUrl && String(returnUrl)) || 'https://www.nerdherdmc.net/new-account';
-    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
-
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       customer_creation: 'always',
       customer_email: email,
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: cancelUrl,
+
+      // IMPORTANT: classic redirect with session id placeholder
+      success_url: `${successBase}?cs={CHECKOUT_SESSION_ID}`,
+      cancel_url:  cancelUrl,
+
       allow_promotion_codes: true,
     });
 
     return res.json({ url: session.url });
-  } catch (e) {
-    console.error('[checkout_public] error:', e);
-    return res.status(500).json({ error: 'Checkout failed' });
+  } catch (err) {
+    // Return structured detail so your Wix UI shows the real cause
+    console.error('[checkout_public] stripe error:', {
+      type: err?.type,
+      code: err?.code,
+      param: err?.param,
+      message: err?.message
+    });
+    const status = err?.statusCode || 400;
+    return res.status(status).json({
+      error: 'stripe_error',
+      code: err?.code || 'unknown',
+      message: err?.message || 'Checkout failed',
+      param: err?.param || null
+    });
   }
 });
+
 
 // Optional sanity check
 app.get('/billing/price_check', async (_req, res) => {
