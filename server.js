@@ -8,6 +8,7 @@ import nodemailer from 'nodemailer';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
 import { PrismaClient } from '@prisma/client';
+import { URL } from 'url';
 
 // ---------- env ----------
 const {
@@ -43,47 +44,52 @@ const stripe = new Stripe(STRIPE_SECRET_KEY);
 app.use('/health', (req, res, next) => next());
 
 // CORS
-const allowed = (CORS_ORIGINS || '')
+
+const exactAllowed = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-      cb(new Error('Not allowed by CORS: ' + origin));
-    },
-    credentials: true,
-  })
-);
+// Suffix rules for known preview/editor hosts that spawn random subdomains.
+// Keep this list small & intentional.
+const allowedSuffixes = [
+  '.wixsite.com',       // some Wix hosting variants
+  '.dev.wix-code.com',  // Wix Editor preview
+  '.editor.wix.com',    // editor shell
+];
 
-// Rate-limit (skip health & webhooks)
-app.use(rateLimit({
-  windowMs: 60 * 1000,
-  limit: 120,
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => req.path === '/health' || req.path.startsWith('/webhooks/'),
-}));
-
-// ---------- utilities ----------
-const log = (...a) => console.log(...a);
-
-const signAccess = (user) =>
-  jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
-
-function auth(req, res, next) {
+// Normalizes origin and checks exact + suffix rules
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // allow server-to-server / curl (no Origin)
   try {
-    const h = req.headers.authorization || '';
-    const [, token] = h.split(' ');
-    if (!token) return res.status(401).json({ error: 'Missing bearer token' });
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
+    const u = new URL(origin);
+    const host = u.host.toLowerCase();
+
+    // Exact allow (e.g. https://www.nerdherdmc.net)
+    if (exactAllowed.includes(origin)) return true;
+    if (exactAllowed.includes(`${u.protocol}//${host}`)) return true; // guard for trailing slashes in envs
+
+    // Suffix allow (preview/editor)
+    if (allowedSuffixes.some(suf => host.endsWith(suf))) return true;
+
+    // Also allow your canonical site domain even if not listed exactly in env
+    if (host === 'www.nerdherdmc.net' || host === 'nerdherdmc.net') return true;
+
+    return false;
   } catch {
-    res.status(401).json({ error: 'Invalid token' });
+    return false;
   }
 }
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (isAllowedOrigin(origin)) return cb(null, true);
+    cb(new Error(`Not allowed by CORS: ${origin}`));
+  },
+  credentials: true,
+  // Preflight caching helps a bit
+  maxAge: 86400,
+}));
 
 // ---------- SMTP ----------
 let transporter = null;
