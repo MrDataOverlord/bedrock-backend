@@ -459,30 +459,66 @@ app.get('/entitlements', auth, async (req, res) => {
 });
 
 // ---------- Public checkout for subscriptions ----------
+// ---------- POST /billing/checkout_public ----------
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
-    if (!email) return res.status(400).json({ error: 'email required' });
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) {
+      return res.status(400).json({ error: 'invalid_email', message: 'A valid email is required.' });
+    }
 
+    // Resolve URLs
     const successUrl = (returnUrl && String(returnUrl)) || 'https://www.nerdherdmc.net/new-account';
-    const cancelUrl = 'https://www.nerdherdmc.net/accounts';
+    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
-    // in subscription mode, do NOT use customer_creation — Stripe will handle the Customer via email
+    // Sanity check the Price so Stripe won’t 400 later for shape/inactive price
+    let price;
+    try {
+      price = await stripe.prices.retrieve(STRIPE_PRICE_PREMIUM);
+      if (!price?.active) {
+        return res.status(400).json({ error: 'price_inactive', message: 'Subscription price is inactive.' });
+      }
+      if (price?.type !== 'recurring') {
+        return res.status(400).json({ error: 'price_not_recurring', message: 'Subscription price must be recurring.' });
+      }
+    } catch (err) {
+      console.error('[checkout_public] price lookup error:', err?.message || err);
+      return res.status(500).json({ error: 'stripe_error', message: 'Failed to verify subscription price.' });
+    }
+
+    // Build the session – subscription mode, no customer_creation for subscriptions
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: email,
+      customer_email: email,           // prefill & associate
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      allow_promotion_codes: true,
+      // Classic success/cancel (Stripe recommends session_id token)
       success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: cancelUrl,
-      allow_promotion_codes: true,
+      // ui_mode defaults to hosted; no after_completion for subscription mode
     });
+
+    if (!session?.url) {
+      console.error('[checkout_public] no session.url returned:', session);
+      return res.status(500).json({ error: 'stripe_error', message: 'Could not create checkout session.' });
+    }
 
     return res.json({ url: session.url });
   } catch (e) {
-    console.error('[checkout_public] error:', e);
-    return res.status(500).json({ error: 'Checkout failed' });
+    // Pull as much signal as possible from Stripe/SDK errors
+    const detail = e?.raw?.message || e?.message || String(e);
+    const type   = e?.type || 'StripeError';
+    const param  = e?.param;
+    console.error('[checkout_public] stripe error:', { type, param, detail });
+
+    // Return a friendly, inspectable payload (Wix can display .message)
+    const payload = { error: 'stripe_error', type, param, message: detail };
+    // Use 400 for Stripe request errors, 500 otherwise
+    const status = (type && type.includes('InvalidRequest')) ? 400 : 500;
+    return res.status(status).json(payload);
   }
 });
+
 
 // ---------- Price sanity check ----------
 app.get('/billing/price_check', async (_req, res) => {
