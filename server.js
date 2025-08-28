@@ -402,15 +402,19 @@ app.post('/auth/reset/complete', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Entitlements (with self-heal if Stripe already has customer) ----------
+// ---------- Entitlements (with robust self-heal) ----------
 async function getEntitlementsPayload(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
 
+  // read what we already know
   let orgsRaw = await prisma.org.findMany({
-    where: { OR: [{ ownerUserId: userId }, { members: { some: { userId } } }] },
+    where: {
+      OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
+    },
     select: {
       id: true,
       name: true,
+      stripeCustomerId: true,
       subscriptions: {
         orderBy: { updatedAt: 'desc' },
         take: 1,
@@ -419,40 +423,56 @@ async function getEntitlementsPayload(userId) {
     },
   });
 
-  // Self-heal: if nothing is linked yet but Stripe already knows the customer via email
-  if (!orgsRaw.length && user?.email) {
+  // helper: does any current org look premium?
+  const hasPremiumNow = orgsRaw.some(o => {
+    const s = o.subscriptions[0];
+    return s && (['active', 'trialing'].includes(String(s.status).toLowerCase())) &&
+           s.currentPeriodEnd && s.currentPeriodEnd.getTime() > Date.now();
+  });
+
+  // Self-heal if we *don't* have any premium status yet.
+  // This covers: first-time purchase, re-purchase on a new customer, missed webhook, etc.
+  if (!hasPremiumNow && user?.email) {
     try {
+      // Pull *all* customers for this email; grab their subscriptions in one round-trip
       const list = await stripe.customers.list({
         email: user.email,
-        limit: 1,
+        limit: 100,
         expand: ['data.subscriptions'],
       });
-      const cust = list.data?.[0];
-      if (cust?.id) {
+
+      for (const cust of list.data || []) {
+        const customerId = cust.id;
+
+        // Ensure we have an org/member for each Stripe customer
         const org = await ensureOrgAndMember({
           userId,
-          customerId: cust.id,
+          customerId,
           customerName: cust.name,
           email: user.email,
         });
 
-        const sub = cust.subscriptions?.data?.[0];
-        if (sub) await upsertSubscription({ orgId: org.id, sub });
-
-        // re-read
-        orgsRaw = await prisma.org.findMany({
-          where: { OR: [{ ownerUserId: userId }, { members: { some: { userId } } }] },
-          select: {
-            id: true,
-            name: true,
-            subscriptions: {
-              orderBy: { updatedAt: 'desc' },
-              take: 1,
-              select: { status: true, currentPeriodEnd: true },
-            },
-          },
-        });
+        // Sync every subscription we can see (active/paused/canceled all get upserted)
+        for (const sub of (cust.subscriptions?.data || [])) {
+          await upsertSubscription({ orgId: org.id, sub });
+        }
       }
+
+      // Re-read after healing
+      orgsRaw = await prisma.org.findMany({
+        where: {
+          OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
+        },
+        select: {
+          id: true,
+          name: true,
+          subscriptions: {
+            orderBy: { updatedAt: 'desc' },
+            take: 1,
+            select: { status: true, currentPeriodEnd: true },
+          },
+        },
+      });
     } catch (e) {
       console.error('[entitlements self-heal] failed:', e?.message || e);
     }
@@ -460,7 +480,12 @@ async function getEntitlementsPayload(userId) {
 
   const orgs = orgsRaw.map((o) => {
     const sub = o.subscriptions[0];
-    const premium = sub ? isPremium(sub.status, sub.currentPeriodEnd) : false;
+    const premium =
+      sub &&
+      (['active', 'trialing'].includes(String(sub.status).toLowerCase())) &&
+      sub.currentPeriodEnd &&
+      sub.currentPeriodEnd.getTime() > Date.now();
+
     return {
       id: o.id,
       name: o.name,
@@ -472,6 +497,7 @@ async function getEntitlementsPayload(userId) {
 
   return { user: { id: user.id, email: user.email }, orgs };
 }
+
 
 app.get('/account/me', auth, async (req, res) => {
   res.set('Cache-Control', 'no-store');
