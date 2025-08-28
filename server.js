@@ -7,6 +7,7 @@ import bcrypt from 'bcryptjs';
 import nodemailer from 'nodemailer';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
 import { PrismaClient } from '@prisma/client';
 import { URL } from 'url';
 
@@ -41,7 +42,19 @@ const prisma = new PrismaClient();
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 const log = (...a) => console.log(...a);
 
-// Health is plain (skip rate-limit/CORS for quick probes)
+// security headers
+app.disable('x-powered-by');
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // Wix injects scripts; customize later if needed
+    frameguard: { action: 'deny' },
+    referrerPolicy: { policy: 'no-referrer' },
+    crossOriginOpenerPolicy: { policy: 'same-origin' },
+    hsts: { maxAge: 15552000, includeSubDomains: true, preload: true },
+  })
+);
+
+// Health is plain (skip CORS/ratelimit friction)
 app.use('/health', (req, res, next) => next());
 
 // ---------- CORS ----------
@@ -52,27 +65,20 @@ const exactAllowed = (CORS_ORIGINS || '')
 
 // Known preview/editor suffixes that spawn random subdomains
 const allowedSuffixes = [
-  '.wixsite.com',        // Wix hosting variants
-  '.dev.wix-code.com',   // Wix Editor preview
-  '.editor.wix.com',     // Wix editor shell
+  '.wixsite.com',
+  '.dev.wix-code.com',
+  '.editor.wix.com',
 ];
 
 function isAllowedOrigin(origin) {
-  if (!origin) return true;                   // server-to-server/no CORS
+  if (!origin) return true; // server-to-server/no CORS
   try {
     const u = new URL(origin);
     const host = u.host.toLowerCase();
-
-    // exact match on full origin string (protocol + host [+ optional port])
     if (exactAllowed.includes(origin)) return true;
     if (exactAllowed.includes(`${u.protocol}//${host}`)) return true;
-
-    // suffix (preview/editor)
     if (allowedSuffixes.some(suf => host.endsWith(suf))) return true;
-
-    // always allow your canonical site domains even if not listed
     if (host === 'www.nerdherdmc.net' || host === 'nerdherdmc.net') return true;
-
     return false;
   } catch {
     return false;
@@ -87,17 +93,25 @@ app.use(
   })
 );
 
-// ---------- Rate-limit (skip health & webhooks) ----------
-app.use(
-  rateLimit({
-    windowMs: 60 * 1000,
-    limit: 120,
-    standardHeaders: true,
-    legacyHeaders: false,
-    skip: (req) => req.path === '/health' || req.path.startsWith('/webhooks/'),
-  })
-);
+// ---------- Rate-limit ----------
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health' || req.path.startsWith('/webhooks/'),
+});
+app.use(globalLimiter);
 
+// per-IP+email limiter for login brute-force
+const loginLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 20,
+  keyGenerator: (req) => `${req.ip}:${(req.body?.email || '').toLowerCase()}`,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+ 
 // ---------- body parsing (keep raw for Stripe) ----------
 app.use(
   express.json({
@@ -123,6 +137,18 @@ function auth(req, res, next) {
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// sanitize returnUrl so it only goes to your site
+const ALLOWED_REDIRECT_HOSTS = new Set(['nerdherdmc.net', 'www.nerdherdmc.net']);
+function sanitizeReturnUrl(raw) {
+  try {
+    const u = new URL(String(raw));
+    if (!ALLOWED_REDIRECT_HOSTS.has(u.hostname)) throw new Error('bad host');
+    return `https://www.nerdherdmc.net${u.pathname}${u.search}`;
+  } catch {
+    return 'https://www.nerdherdmc.net/new-account';
   }
 }
 
@@ -253,7 +279,7 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, env: NODE_ENV, ts: new Date().toISOString() });
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', loginLimiter, async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
   const user = await prisma.user.findUnique({ where: { email } });
@@ -381,9 +407,7 @@ async function getEntitlementsPayload(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
 
   let orgsRaw = await prisma.org.findMany({
-    where: {
-      OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-    },
+    where: { OR: [{ ownerUserId: userId }, { members: { some: { userId } } }] },
     select: {
       id: true,
       name: true,
@@ -417,9 +441,7 @@ async function getEntitlementsPayload(userId) {
 
         // re-read
         orgsRaw = await prisma.org.findMany({
-          where: {
-            OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-          },
+          where: { OR: [{ ownerUserId: userId }, { members: { some: { userId } } }] },
           select: {
             id: true,
             name: true,
@@ -452,14 +474,17 @@ async function getEntitlementsPayload(userId) {
 }
 
 app.get('/account/me', auth, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 app.get('/entitlements', auth, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 
-// ---------- Public checkout for subscriptions ----------
-// ---------- POST /billing/checkout_public ----------
+// ---------- Billing: checkout flows ----------
+
+// Public flow (kept for compatibility with your /accounts page)
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
@@ -467,11 +492,10 @@ app.post('/billing/checkout_public', async (req, res) => {
       return res.status(400).json({ error: 'invalid_email', message: 'A valid email is required.' });
     }
 
-    // Resolve URLs
-    const successUrl = (returnUrl && String(returnUrl)) || 'https://www.nerdherdmc.net/new-account';
+    const successUrl = sanitizeReturnUrl(returnUrl);
     const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
-    // Sanity check the Price so Stripe won’t 400 later for shape/inactive price
+    // Sanity check the Price so Stripe won’t 400 later
     let price;
     try {
       price = await stripe.prices.retrieve(STRIPE_PRICE_PREMIUM);
@@ -486,16 +510,13 @@ app.post('/billing/checkout_public', async (req, res) => {
       return res.status(500).json({ error: 'stripe_error', message: 'Failed to verify subscription price.' });
     }
 
-    // Build the session – subscription mode, no customer_creation for subscriptions
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: email,           // prefill & associate
+      customer_email: email,
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
       allow_promotion_codes: true,
-      // Classic success/cancel (Stripe recommends session_id token)
       success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: cancelUrl,
-      // ui_mode defaults to hosted; no after_completion for subscription mode
     });
 
     if (!session?.url) {
@@ -505,20 +526,86 @@ app.post('/billing/checkout_public', async (req, res) => {
 
     return res.json({ url: session.url });
   } catch (e) {
-    // Pull as much signal as possible from Stripe/SDK errors
     const detail = e?.raw?.message || e?.message || String(e);
     const type   = e?.type || 'StripeError';
     const param  = e?.param;
     console.error('[checkout_public] stripe error:', { type, param, detail });
-
-    // Return a friendly, inspectable payload (Wix can display .message)
-    const payload = { error: 'stripe_error', type, param, message: detail };
-    // Use 400 for Stripe request errors, 500 otherwise
     const status = (type && type.includes('InvalidRequest')) ? 400 : 500;
-    return res.status(status).json(payload);
+    return res.status(status).json({ error: 'stripe_error', type, param, message: detail });
   }
 });
 
+// Authenticated variant (optional; use if you want checkout tied to the signed-in user)
+app.post('/billing/checkout', auth, async (req, res) => {
+  try {
+    const { returnUrl } = req.body || {};
+    const successUrl = sanitizeReturnUrl(returnUrl);
+    const user = await prisma.user.findUnique({ where: { id: req.user.sub } });
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer_email: user.email,
+      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      allow_promotion_codes: true,
+      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: 'https://www.nerdherdmc.net/accounts',
+    });
+
+    return res.json({ url: session.url });
+  } catch (e) {
+    const detail = e?.raw?.message || e?.message || String(e);
+    console.error('[checkout] error:', detail);
+    return res.status(500).json({ error: 'stripe_error', message: detail });
+  }
+});
+
+// Post-checkout repair: force link Org/Member/Sub immediately (no webhook wait)
+app.post('/billing/checkout_sync', auth, async (req, res) => {
+  try {
+    const { session_id } = req.body || {};
+    if (!session_id) return res.status(400).json({ error: 'Missing session_id' });
+
+    const s = await stripe.checkout.sessions.retrieve(session_id, {
+      expand: ['subscription', 'customer', 'customer.invoice_settings.default_payment_method'],
+    });
+    if (!s) return res.status(404).json({ error: 'Session not found' });
+    if (s.mode !== 'subscription') return res.status(400).json({ error: 'Not a subscription session' });
+
+    const email = s.customer_details?.email || s.customer_email;
+    const customerId = typeof s.customer === 'string' ? s.customer : s.customer?.id;
+    if (!email || !customerId) return res.status(400).json({ error: 'Missing email/customer on session' });
+
+    let user = await prisma.user.findUnique({ where: { id: req.user.sub } });
+    if (!user || user.email.toLowerCase() !== email.toLowerCase()) {
+      console.warn('[checkout_sync] email mismatch jwt=', user?.email, ' session=', email);
+      user = await prisma.user.upsert({
+        where: { email },
+        update: {},
+        create: { email },
+      });
+    }
+
+    const cust = await getStripeCustomer(customerId);
+    const org = await ensureOrgAndMember({
+      userId: user.id,
+      customerId,
+      customerName: cust?.name,
+      email,
+    });
+
+    const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription?.id;
+    if (subId) {
+      const sub = await stripe.subscriptions.retrieve(subId);
+      await upsertSubscription({ orgId: org.id, sub });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[checkout_sync] error:', e?.message || e);
+    return res.status(500).json({ error: 'sync_failed' });
+  }
+});
 
 // ---------- Price sanity check ----------
 app.get('/billing/price_check', async (_req, res) => {
@@ -554,24 +641,18 @@ app.post('/webhooks/stripe', async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  try {
-    console.log('[webhook] received:', event.type, event.id);
-  } catch {}
+  try { console.log('[webhook] received:', event.type, event.id); } catch {}
 
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
         const s = event.data.object;
         const email = s.customer_details?.email || s.customer_email;
-        console.log('[webhook] session.completed for email:', email, 'sub:', s.subscription);
-
         if (!email) break;
 
-        // ensure user
         let user = await prisma.user.findUnique({ where: { email } });
         if (!user) user = await prisma.user.create({ data: { email } });
 
-        // registration email if needed
         if (!user.passwordHash) {
           try {
             const rawTok = await issueRegistrationToken(user.id);
@@ -582,7 +663,6 @@ app.post('/webhooks/stripe', async (req, res) => {
           }
         }
 
-        // org/member/sub sync
         const customerId = s.customer;
         if (customerId) {
           const cust = await getStripeCustomer(customerId);
