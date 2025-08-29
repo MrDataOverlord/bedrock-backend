@@ -496,17 +496,17 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
     });
     const customerId = org?.stripeCustomerId || null;
 
-    const successUrl = 'https://www.nerdherdmc.net/new-account';
-    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
+    // For renewals, always send them back to /accounts (no set-password flow)
+    const successUrl = 'https://www.nerdherdmc.net/accounts?session_id={CHECKOUT_SESSION_ID}';
+    const cancelUrl  = 'https://www.nerdherdmc.net/accounts?renew_canceled=true';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       line_items: [{ price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      // prefer linking to an existing customer, else let Stripe create/link
       ...(customerId
         ? { customer: customerId }
         : { customer_creation: 'always', customer_email: user.email }),
-      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+      success_url: successUrl,
       cancel_url: cancelUrl,
       allow_promotion_codes: true,
     });
@@ -517,6 +517,7 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
     return res.status(500).json({ error: 'Checkout failed' });
   }
 });
+
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
