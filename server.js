@@ -475,47 +475,34 @@ app.post('/billing/checkout_public', async (req, res) => {
 });
 
 // POST /billing/checkout_renew
-app.post('/billing/checkout_renew', auth, async (req, res) => {
+app.post('/billing/checkout_renew', authMiddleware, async (req, res) => {
   try {
     const userId = req.user?.id;
     if (!userId) {
-      console.error('[checkout_renew] No userId in token');
-      return res.status(401).json({ error: 'Not signed in' });
+      console.warn('[checkout_renew] No userId in token');
+      return res.status(401).json({ error: 'Unauthorized' });
     }
 
     const user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user?.email) {
-      console.error('[checkout_renew] No user found for id', userId);
-      return res.status(400).json({ error: 'User not found' });
-    }
+    if (!user?.email) throw new Error('User not found');
 
-    // Find org tied to this user
-    const org = await prisma.org.findFirst({ where: { ownerUserId: userId } });
-    if (!org?.stripeCustomerId) {
-      console.error('[checkout_renew] No stripeCustomerId for org', org?.id);
-      return res.status(400).json({ error: 'No Stripe customer linked to this account' });
-    }
-
-    // Create renewal checkout session
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer: org.stripeCustomerId,
+      customer_email: user.email,
       line_items: [
         { price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }
       ],
-      success_url: 'https://www.nerdherdmc.net/accounts?session_id={CHECKOUT_SESSION_ID}',
-      cancel_url:  'https://www.nerdherdmc.net/accounts',
-      allow_promotion_codes: true,
+      success_url: 'https://www.nerdherdmc.net/account?renew_success=true',
+      cancel_url:  'https://www.nerdherdmc.net/account?renew_cancel=true',
     });
-
-    console.log('[checkout_renew] Created session', session.id, 'for user', user.email);
 
     return res.json({ url: session.url });
   } catch (err) {
     console.error('[checkout_renew] error:', err);
-    return res.status(500).json({ error: err.message || 'Renewal checkout failed' });
+    return res.status(500).json({ error: 'Renewal checkout failed' });
   }
 });
+
 
 
 // ----- Price sanity check -----
