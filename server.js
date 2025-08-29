@@ -7,9 +7,7 @@ import bcrypt from 'bcryptjs';
 import nodemailer from 'nodemailer';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
-import helmet from 'helmet';
 import { PrismaClient } from '@prisma/client';
-import { URL } from 'url';
 
 // ---------- env ----------
 const {
@@ -40,91 +38,39 @@ app.set('trust proxy', 1);
 
 const prisma = new PrismaClient();
 const stripe = new Stripe(STRIPE_SECRET_KEY);
-const log = (...a) => console.log(...a);
 
-// security headers
-app.disable('x-powered-by');
-app.use(
-  helmet({
-    contentSecurityPolicy: false, // Wix injects scripts; customize later if needed
-    frameguard: { action: 'deny' },
-    referrerPolicy: { policy: 'no-referrer' },
-    crossOriginOpenerPolicy: { policy: 'same-origin' },
-    hsts: { maxAge: 15552000, includeSubDomains: true, preload: true },
-  })
-);
-
-// Health is plain (skip CORS/ratelimit friction)
+// Health is plain
 app.use('/health', (req, res, next) => next());
 
-// ---------- CORS ----------
-const exactAllowed = (CORS_ORIGINS || '')
+// CORS
+const allowed = (CORS_ORIGINS || 'https://nerdherdmc.net,https://www.nerdherdmc.net')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-// Known preview/editor suffixes that spawn random subdomains
-const allowedSuffixes = [
-  '.wixsite.com',
-  '.dev.wix-code.com',
-  '.editor.wix.com',
-];
-
-function isAllowedOrigin(origin) {
-  if (!origin) return true; // server-to-server/no CORS
-  try {
-    const u = new URL(origin);
-    const host = u.host.toLowerCase();
-    if (exactAllowed.includes(origin)) return true;
-    if (exactAllowed.includes(`${u.protocol}//${host}`)) return true;
-    if (allowedSuffixes.some(suf => host.endsWith(suf))) return true;
-    if (host === 'www.nerdherdmc.net' || host === 'nerdherdmc.net') return true;
-    return false;
-  } catch {
-    return false;
-  }
-}
-
 app.use(
   cors({
-    origin: (origin, cb) => (isAllowedOrigin(origin) ? cb(null, true) : cb(new Error(`Not allowed by CORS: ${origin}`))),
+    origin: (origin, cb) => {
+      if (!origin || allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
+      cb(new Error('Not allowed by CORS: ' + origin));
+    },
     credentials: true,
-    maxAge: 86400,
   })
 );
 
-// ---------- Rate-limit ----------
-const globalLimiter = rateLimit({
+// Rate-limit (skip health & webhooks)
+app.use(rateLimit({
   windowMs: 60 * 1000,
   limit: 120,
   standardHeaders: true,
   legacyHeaders: false,
   skip: (req) => req.path === '/health' || req.path.startsWith('/webhooks/'),
-});
-app.use(globalLimiter);
+}));
 
-// per-IP+email limiter for login brute-force
-const loginLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  limit: 20,
-  keyGenerator: (req) => `${req.ip}:${(req.body?.email || '').toLowerCase()}`,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
- 
-// ---------- body parsing (keep raw for Stripe) ----------
-app.use(
-  express.json({
-    verify: (req, _res, buf) => {
-      if (req.originalUrl === '/webhooks/stripe') {
-        // @ts-ignore
-        req.rawBody = buf;
-      }
-    },
-  })
-);
+// ---------- utilities ----------
+const log = (...a) => console.log(...a);
+const isEmail = (s) => typeof s === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
 
-// ---------- auth helpers ----------
 const signAccess = (user) =>
   jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
 
@@ -140,18 +86,6 @@ function auth(req, res, next) {
   }
 }
 
-// sanitize returnUrl so it only goes to your site
-const ALLOWED_REDIRECT_HOSTS = new Set(['nerdherdmc.net', 'www.nerdherdmc.net']);
-function sanitizeReturnUrl(raw) {
-  try {
-    const u = new URL(String(raw));
-    if (!ALLOWED_REDIRECT_HOSTS.has(u.hostname)) throw new Error('bad host');
-    return `https://www.nerdherdmc.net${u.pathname}${u.search}`;
-  } catch {
-    return 'https://www.nerdherdmc.net/new-account';
-  }
-}
-
 // ---------- SMTP ----------
 let transporter = null;
 (async () => {
@@ -162,12 +96,8 @@ let transporter = null;
       secure: String(SMTP_SECURE || 'true') === 'true',
       auth: { user: SMTP_USER, pass: SMTP_PASS },
     });
-    try {
-      await transporter.verify();
-      log('[mail] transporter verified: true');
-    } catch (e) {
-      log('[mail] transporter verify failed:', e?.message);
-    }
+    try { await transporter.verify(); log('[mail] transporter verified: true'); }
+    catch (e) { log('[mail] transporter verify failed:', e?.message); }
   } else {
     log('[mail] SMTP_* not fully configured; email disabled.');
   }
@@ -177,7 +107,7 @@ let transporter = null;
 async function invalidateTokensFor(userId, purpose) {
   await prisma.passwordToken.updateMany({
     where: { userId, purpose, usedAt: null },
-    data: { usedAt: new Date() },
+    data:  { usedAt: new Date() }
   });
 }
 
@@ -193,10 +123,7 @@ async function issueRegistrationToken(userId) {
 }
 
 async function sendRegistrationEmail(email, rawToken) {
-  if (!transporter) {
-    log('[mail] transporter missing, cannot send');
-    return;
-  }
+  if (!transporter) { log('[mail] transporter missing, cannot send'); return; }
   const base = (REG_URL_BASE || '').replace(/\/+$/, '');
   const url = `${base}?token=${encodeURIComponent(rawToken)}&email=${encodeURIComponent(email)}`;
   const info = await transporter.sendMail({
@@ -208,52 +135,62 @@ async function sendRegistrationEmail(email, rawToken) {
   log('[mail] sent:', email, 'messageId:', info.messageId);
 }
 
-// ---------- Stripe / org helpers ----------
-function isPremium(status, end) {
+// ---------- Stripe raw-body ----------
+app.use(express.json({
+  verify: (req, _res, buf) => {
+    if (req.originalUrl === '/webhooks/stripe') {
+      // @ts-ignore
+      req.rawBody = buf;
+    }
+  }
+}));
+
+// ---------- Org / Member / Subscription ----------
+const isPremium = (status, end) => {
   const s = String(status || '').toLowerCase();
   return (s === 'active' || s === 'trialing') && end instanceof Date && end.getTime() > Date.now();
-}
+};
 
-async function getStripeCustomer(customerId) {
-  try {
-    return await stripe.customers.retrieve(customerId, { expand: ['subscriptions'] });
-  } catch {
-    return null;
+async function userHasActivePremium(userId) {
+  const orgs = await prisma.org.findMany({
+    where: {
+      OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
+    },
+    select: {
+      id: true,
+      subscriptions: {
+        orderBy: { updatedAt: 'desc' },
+        take: 1,
+        select: { status: true, currentPeriodEnd: true }
+      }
+    },
+  });
+  for (const o of orgs) {
+    const sub = o.subscriptions?.[0];
+    if (sub && isPremium(sub.status, sub.currentPeriodEnd)) return true;
   }
+  return false;
 }
 
 async function ensureOrgAndMember({ userId, customerId, customerName, email }) {
-  if (!customerId) throw new Error('ensureOrgAndMember: missing customerId');
-
   let org = await prisma.org.findFirst({ where: { stripeCustomerId: customerId } });
 
   if (!org) {
-    const fallbackName = customerName || (email ? `${String(email).split('@')[0]}'s Org` : 'Account');
+    const fallbackName = customerName || (email ? `${email.split('@')[0]}'s Org` : 'Account');
     org = await prisma.org.create({
-      data: {
-        name: fallbackName,
-        stripeCustomerId: customerId,
-        ownerUserId: userId ?? null,
-      },
+      data: { name: fallbackName, stripeCustomerId: customerId, ownerUserId: userId || null }
     });
-    log('[org] created', org.id, 'cust:', customerId);
   } else if (userId && !org.ownerUserId) {
-    org = await prisma.org.update({
-      where: { id: org.id },
-      data: { ownerUserId: userId },
-    });
-    log('[org] repaired owner', org.id, '->', userId);
+    org = await prisma.org.update({ where: { id: org.id }, data: { ownerUserId: userId } });
   }
 
   if (userId) {
     await prisma.member.upsert({
       where: { orgId_userId: { orgId: org.id, userId } },
       update: {},
-      create: { orgId: org.id, userId, role: 'owner' },
+      create: { orgId: org.id, userId, role: 'owner' }
     });
-    log('[member] ensured link user', userId, 'org', org.id);
   }
-
   return org;
 }
 
@@ -268,18 +205,23 @@ async function upsertSubscription({ orgId, sub }) {
       provider: 'stripe',
       status: sub.status,
       currentPeriodEnd: end,
-      customerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id,
+      customerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id
     },
-    update: { status: sub.status, currentPeriodEnd: end },
+    update: { status: sub.status, currentPeriodEnd: end }
   });
 }
+
+const getStripeCustomer = async (customerId) => {
+  try { return await stripe.customers.retrieve(customerId); }
+  catch { return null; }
+};
 
 // ---------- public endpoints ----------
 app.get('/health', (req, res) => {
   res.json({ ok: true, env: NODE_ENV, ts: new Date().toISOString() });
 });
 
-app.post('/auth/login', loginLimiter, async (req, res) => {
+app.post('/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
   const user = await prisma.user.findUnique({ where: { email } });
@@ -289,7 +231,7 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
   res.json({ access: signAccess(user) });
 });
 
-// Registration / reset flows (token-anchored)
+// ----- Registration completion (token-anchored, ignores email) -----
 app.post('/auth/register/complete', async (req, res) => {
   const { token, password } = req.body || {};
   if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
@@ -316,6 +258,7 @@ app.post('/auth/register/complete', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ----- Resend registration email (if no password yet) -----
 app.post('/auth/register/resend', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
@@ -329,6 +272,7 @@ app.post('/auth/register/resend', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ----- Manual start registration (recovery path / resend button) -----
 app.post('/auth/register/start', async (req, res) => {
   try {
     const { email } = req.body || {};
@@ -337,7 +281,9 @@ app.post('/auth/register/start', async (req, res) => {
     let user = await prisma.user.findUnique({ where: { email } });
     if (!user) user = await prisma.user.create({ data: { email } });
 
-    if (user.passwordHash) return res.json({ ok: true, note: 'already_has_password' });
+    if (user.passwordHash) {
+      return res.json({ ok: true, note: 'already_has_password' });
+    }
 
     const raw = await issueRegistrationToken(user.id);
     await sendRegistrationEmail(user.email, raw);
@@ -348,6 +294,7 @@ app.post('/auth/register/start', async (req, res) => {
   }
 });
 
+// ----- Forgot password (start) -----
 app.post('/auth/reset/start', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Missing email' });
@@ -380,6 +327,7 @@ app.post('/auth/reset/start', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ----- Forgot password (complete) – token-anchored -----
 app.post('/auth/reset/complete', async (req, res) => {
   const { token, newPassword } = req.body || {};
   if (!token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
@@ -402,90 +350,77 @@ app.post('/auth/reset/complete', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Entitlements (with robust self-heal) ----------
+// ----- Entitlements (with broadened self-heal) -----
 async function getEntitlementsPayload(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
 
-  // read what we already know
+  // Grab all orgs this user touches
   let orgsRaw = await prisma.org.findMany({
     where: {
       OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
     },
     select: {
-      id: true,
-      name: true,
-      stripeCustomerId: true,
+      id: true, name: true, stripeCustomerId: true,
       subscriptions: {
         orderBy: { updatedAt: 'desc' },
         take: 1,
-        select: { status: true, currentPeriodEnd: true },
-      },
+        select: { status: true, currentPeriodEnd: true }
+      }
     },
   });
 
-  // helper: does any current org look premium?
+  // Determine if we currently have any premium
   const hasPremiumNow = orgsRaw.some(o => {
-    const s = o.subscriptions[0];
-    return s && (['active', 'trialing'].includes(String(s.status).toLowerCase())) &&
-           s.currentPeriodEnd && s.currentPeriodEnd.getTime() > Date.now();
-  });
+    const s = o.subscriptions?.[0];
+    return s && isPremium(s.status, s.currentPeriodEnd);
+    });
 
-  // Self-heal if we *don't* have any premium status yet.
-  // This covers: first-time purchase, re-purchase on a new customer, missed webhook, etc.
+  // BROADENED SELF-HEAL: if no premium seen, try Stripe by email, and sync
   if (!hasPremiumNow && user?.email) {
     try {
-      // Pull *all* customers for this email; grab their subscriptions in one round-trip
-      const list = await stripe.customers.list({
-        email: user.email,
-        limit: 100,
-        expand: ['data.subscriptions'],
+      const search = await stripe.customers.search({
+        query: `email:"${user.email}"`,
       });
-
-      for (const cust of list.data || []) {
-        const customerId = cust.id;
-
-        // Ensure we have an org/member for each Stripe customer
+      const cust = search?.data?.[0];
+      if (cust) {
+        // Find or create org linked to customer
         const org = await ensureOrgAndMember({
           userId,
-          customerId,
+          customerId: cust.id,
           customerName: cust.name,
-          email: user.email,
+          email: user.email
         });
 
-        // Sync every subscription we can see (active/paused/canceled all get upserted)
-        for (const sub of (cust.subscriptions?.data || [])) {
+        // Pull the latest sub (if any) and upsert
+        const subs = await stripe.subscriptions.list({ customer: cust.id, limit: 1 });
+        const sub = subs?.data?.[0];
+        if (sub) {
           await upsertSubscription({ orgId: org.id, sub });
         }
-      }
 
-      // Re-read after healing
-      orgsRaw = await prisma.org.findMany({
-        where: {
-          OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-        },
-        select: {
-          id: true,
-          name: true,
-          subscriptions: {
-            orderBy: { updatedAt: 'desc' },
-            take: 1,
-            select: { status: true, currentPeriodEnd: true },
+        // Refresh local view
+        orgsRaw = await prisma.org.findMany({
+          where: {
+            OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
           },
-        },
-      });
+          select: {
+            id: true, name: true, stripeCustomerId: true,
+            subscriptions: {
+              orderBy: { updatedAt: 'desc' },
+              take: 1,
+              select: { status: true, currentPeriodEnd: true }
+            }
+          },
+        });
+      }
     } catch (e) {
-      console.error('[entitlements self-heal] failed:', e?.message || e);
+      console.error('[entitlements self-heal] error:', e?.message || e);
     }
   }
 
-  const orgs = orgsRaw.map((o) => {
+  const orgs = orgsRaw.map(o => {
     const sub = o.subscriptions[0];
-    const premium =
-      sub &&
-      (['active', 'trialing'].includes(String(sub.status).toLowerCase())) &&
-      sub.currentPeriodEnd &&
-      sub.currentPeriodEnd.getTime() > Date.now();
-
+    const premium = sub ? isPremium(sub.status, sub.currentPeriodEnd) : false;
     return {
       id: o.id,
       name: o.name,
@@ -498,142 +433,92 @@ async function getEntitlementsPayload(userId) {
   return { user: { id: user.id, email: user.email }, orgs };
 }
 
-
 app.get('/account/me', auth, async (req, res) => {
-  res.set('Cache-Control', 'no-store');
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 app.get('/entitlements', auth, async (req, res) => {
-  res.set('Cache-Control', 'no-store');
   res.json(await getEntitlementsPayload(req.user.sub));
 });
 
-// ---------- Billing: checkout flows ----------
+// ---------- Billing ----------
 
-// Public flow (kept for compatibility with your /accounts page)
+// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY)
+// Blocks if an account already exists for that email.
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) {
-      return res.status(400).json({ error: 'invalid_email', message: 'A valid email is required.' });
+    if (!isEmail(email)) return res.status(400).json({ error: 'email required' });
+
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) {
+      return res.status(400).json({ error: 'account_exists' });
     }
 
-    const successUrl = sanitizeReturnUrl(returnUrl);
+    const successUrl = (returnUrl && String(returnUrl)) || 'https://www.nerdherdmc.net/new-account';
     const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
-    // Sanity check the Price so Stripe won’t 400 later
-    let price;
-    try {
-      price = await stripe.prices.retrieve(STRIPE_PRICE_PREMIUM);
-      if (!price?.active) {
-        return res.status(400).json({ error: 'price_inactive', message: 'Subscription price is inactive.' });
-      }
-      if (price?.type !== 'recurring') {
-        return res.status(400).json({ error: 'price_not_recurring', message: 'Subscription price must be recurring.' });
-      }
-    } catch (err) {
-      console.error('[checkout_public] price lookup error:', err?.message || err);
-      return res.status(500).json({ error: 'stripe_error', message: 'Failed to verify subscription price.' });
-    }
-
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
+      customer_creation: 'always',
       customer_email: email,
-      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      allow_promotion_codes: true,
+      line_items: [{ price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }],
       success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: cancelUrl,
+      allow_promotion_codes: true,
     });
-
-    if (!session?.url) {
-      console.error('[checkout_public] no session.url returned:', session);
-      return res.status(500).json({ error: 'stripe_error', message: 'Could not create checkout session.' });
-    }
 
     return res.json({ url: session.url });
   } catch (e) {
-    const detail = e?.raw?.message || e?.message || String(e);
-    const type   = e?.type || 'StripeError';
-    const param  = e?.param;
-    console.error('[checkout_public] stripe error:', { type, param, detail });
-    const status = (type && type.includes('InvalidRequest')) ? 400 : 500;
-    return res.status(status).json({ error: 'stripe_error', type, param, message: detail });
+    console.error('[checkout_public] error:', e);
+    return res.status(500).json({ error: 'Checkout failed' });
   }
 });
 
-// Authenticated variant (optional; use if you want checkout tied to the signed-in user)
-app.post('/billing/checkout', auth, async (req, res) => {
+// AUTH’D RENEW CHECKOUT (ONLY WHEN NO ACTIVE PREMIUM)
+app.post('/billing/checkout_renew', auth, async (req, res) => {
   try {
-    const { returnUrl } = req.body || {};
-    const successUrl = sanitizeReturnUrl(returnUrl);
-    const user = await prisma.user.findUnique({ where: { id: req.user.sub } });
-    if (!user) return res.status(401).json({ error: 'unauthorized' });
+    const userId = req.user.sub;
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user?.email) return res.status(400).json({ error: 'missing_email' });
+
+    // If already premium, block renew
+    if (await userHasActivePremium(userId)) {
+      return res.status(400).json({ error: 'already_active' });
+    }
+
+    // Try to reuse a known customer if any org has it
+    const org = await prisma.org.findFirst({
+      where: {
+        OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
+        stripeCustomerId: { not: null }
+      },
+      select: { stripeCustomerId: true }
+    });
+    const customerId = org?.stripeCustomerId || null;
+
+    const successUrl = 'https://www.nerdherdmc.net/new-account';
+    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: user.email,
-      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      allow_promotion_codes: true,
+      line_items: [{ price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      // prefer linking to an existing customer, else let Stripe create/link
+      ...(customerId
+        ? { customer: customerId }
+        : { customer_creation: 'always', customer_email: user.email }),
       success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: 'https://www.nerdherdmc.net/accounts',
+      cancel_url: cancelUrl,
+      allow_promotion_codes: true,
     });
 
     return res.json({ url: session.url });
   } catch (e) {
-    const detail = e?.raw?.message || e?.message || String(e);
-    console.error('[checkout] error:', detail);
-    return res.status(500).json({ error: 'stripe_error', message: detail });
+    console.error('[checkout_renew] error:', e);
+    return res.status(500).json({ error: 'Checkout failed' });
   }
 });
 
-// Post-checkout repair: force link Org/Member/Sub immediately (no webhook wait)
-app.post('/billing/checkout_sync', auth, async (req, res) => {
-  try {
-    const { session_id } = req.body || {};
-    if (!session_id) return res.status(400).json({ error: 'Missing session_id' });
-
-    const s = await stripe.checkout.sessions.retrieve(session_id, {
-      expand: ['subscription', 'customer', 'customer.invoice_settings.default_payment_method'],
-    });
-    if (!s) return res.status(404).json({ error: 'Session not found' });
-    if (s.mode !== 'subscription') return res.status(400).json({ error: 'Not a subscription session' });
-
-    const email = s.customer_details?.email || s.customer_email;
-    const customerId = typeof s.customer === 'string' ? s.customer : s.customer?.id;
-    if (!email || !customerId) return res.status(400).json({ error: 'Missing email/customer on session' });
-
-    let user = await prisma.user.findUnique({ where: { id: req.user.sub } });
-    if (!user || user.email.toLowerCase() !== email.toLowerCase()) {
-      console.warn('[checkout_sync] email mismatch jwt=', user?.email, ' session=', email);
-      user = await prisma.user.upsert({
-        where: { email },
-        update: {},
-        create: { email },
-      });
-    }
-
-    const cust = await getStripeCustomer(customerId);
-    const org = await ensureOrgAndMember({
-      userId: user.id,
-      customerId,
-      customerName: cust?.name,
-      email,
-    });
-
-    const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription?.id;
-    if (subId) {
-      const sub = await stripe.subscriptions.retrieve(subId);
-      await upsertSubscription({ orgId: org.id, sub });
-    }
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('[checkout_sync] error:', e?.message || e);
-    return res.status(500).json({ error: 'sync_failed' });
-  }
-});
-
-// ---------- Price sanity check ----------
+// ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
   try {
     const p = await stripe.prices.retrieve(STRIPE_PRICE_PREMIUM);
@@ -643,7 +528,7 @@ app.get('/billing/price_check', async (_req, res) => {
       currency: p.currency,
       type: p.type,
       recurring: p.recurring || null,
-      product: typeof p.product === 'string' ? p.product : p.product?.id,
+      product: typeof p.product === 'string' ? p.product : p.product?.id
     });
   } catch (e) {
     console.error('[price_check] error:', e?.message);
@@ -652,7 +537,7 @@ app.get('/billing/price_check', async (_req, res) => {
 });
 
 app.get('/billing/success', (_req, res) => res.send('Payment success\nYou can close this tab.'));
-app.get('/billing/cancel', (_req, res) => res.send('Payment canceled'));
+app.get('/billing/cancel',  (_req, res) => res.send('Payment canceled'));
 
 // ---------- Stripe webhooks ----------
 app.post('/webhooks/stripe', async (req, res) => {
@@ -674,11 +559,15 @@ app.post('/webhooks/stripe', async (req, res) => {
       case 'checkout.session.completed': {
         const s = event.data.object;
         const email = s.customer_details?.email || s.customer_email;
+        console.log('[webhook] session.completed for email:', email, 'sub:', s.subscription);
+
         if (!email) break;
 
+        // Ensure user
         let user = await prisma.user.findUnique({ where: { email } });
         if (!user) user = await prisma.user.create({ data: { email } });
 
+        // Registration mail if needed
         if (!user.passwordHash) {
           try {
             const rawTok = await issueRegistrationToken(user.id);
@@ -689,14 +578,12 @@ app.post('/webhooks/stripe', async (req, res) => {
           }
         }
 
+        // Org/Member/Subscription sync
         const customerId = s.customer;
         if (customerId) {
           const cust = await getStripeCustomer(customerId);
           const org = await ensureOrgAndMember({
-            userId: user.id,
-            customerId,
-            customerName: cust?.name,
-            email,
+            userId: user.id, customerId, customerName: cust?.name, email
           });
 
           if (s.subscription) {
@@ -726,13 +613,18 @@ app.post('/webhooks/stripe', async (req, res) => {
           userId: user?.id ?? undefined,
           customerId,
           customerName: cust?.name,
-          email,
+          email
         });
 
         await upsertSubscription({ orgId: org.id, sub });
         console.log('[webhook] sub sync:', sub.id, 'status:', sub.status);
         break;
       }
+
+      case 'invoice.payment_succeeded':
+      case 'invoice.payment_failed':
+        // Optional: refresh via invoice.subscription
+        break;
 
       default:
         break;
@@ -747,6 +639,5 @@ app.post('/webhooks/stripe', async (req, res) => {
 // ---------- start ----------
 app.listen(PORT, () => {
   log(`API up on :${PORT}`);
-  log('[env] CORS exact allow list:', exactAllowed);
-  log('[env] CORS suffix allow list:', allowedSuffixes);
+  log('[env] allowed CORS:', allowed);
 });
