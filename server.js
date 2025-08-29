@@ -477,47 +477,29 @@ app.post('/billing/checkout_public', async (req, res) => {
 // AUTH’D RENEW CHECKOUT (ONLY WHEN NO ACTIVE PREMIUM)
 app.post('/billing/checkout_renew', auth, async (req, res) => {
   try {
-    const userId = req.user.sub;
+    const userId = req.user?.id;
     const user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user?.email) return res.status(400).json({ error: 'missing_email' });
+    if (!user?.email) return res.status(400).json({ error: 'User email not found' });
 
-    // If already premium, block renew
-    if (await userHasActivePremium(userId)) {
-      return res.status(400).json({ error: 'already_active' });
-    }
-
-    // Try to reuse a known customer if any org has it
-    const org = await prisma.org.findFirst({
-      where: {
-        OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-        stripeCustomerId: { not: null }
-      },
-      select: { stripeCustomerId: true }
-    });
-    const customerId = org?.stripeCustomerId || null;
-
-    // For renewals, always send them back to /accounts (no set-password flow)
-    const successUrl = 'https://www.nerdherdmc.net/accounts?session_id={CHECKOUT_SESSION_ID}';
-    const cancelUrl  = 'https://www.nerdherdmc.net/accounts?renew_canceled=true';
+    // Look up org + stripeCustomerId
+    const org = await prisma.org.findFirst({ where: { ownerUserId: userId } });
+    if (!org?.stripeCustomerId) return res.status(400).json({ error: 'No Stripe customer ID' });
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
+      customer: org.stripeCustomerId,
       line_items: [{ price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      ...(customerId
-        ? { customer: customerId }
-        : { customer_creation: 'always', customer_email: user.email }),
-      success_url: successUrl,
-      cancel_url: cancelUrl,
+      success_url: 'https://www.nerdherdmc.net/accounts?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url:  'https://www.nerdherdmc.net/accounts',
       allow_promotion_codes: true,
     });
 
     return res.json({ url: session.url });
-  } catch (e) {
-    console.error('[checkout_renew] error:', e);
-    return res.status(500).json({ error: 'Checkout failed' });
+  } catch (err) {
+    console.error('[checkout_renew] error:', err);
+    return res.status(500).json({ error: 'Renewal checkout failed' });
   }
 });
-
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
