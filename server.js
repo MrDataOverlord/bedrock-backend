@@ -475,7 +475,7 @@ app.post('/billing/checkout_public', async (req, res) => {
 });
 
 // POST /billing/checkout_renew
-app.post('/billing/checkout_renew', authMiddleware, async (req, res) => {
+app.post('/billing/checkout_renew', authenticateToken, async (req, res) => {
   try {
     const userId = req.user?.id;
     if (!userId) {
@@ -502,8 +502,6 @@ app.post('/billing/checkout_renew', authMiddleware, async (req, res) => {
     return res.status(500).json({ error: 'Renewal checkout failed' });
   }
 });
-
-
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
