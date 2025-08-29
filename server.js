@@ -39,9 +39,6 @@ app.set('trust proxy', 1);
 const prisma = new PrismaClient();
 const stripe = new Stripe(STRIPE_SECRET_KEY);
 
-// Health is plain
-app.use('/health', (req, res, next) => next());
-
 // CORS
 const allowed = (CORS_ORIGINS || 'https://nerdherdmc.net,https://www.nerdherdmc.net')
   .split(',')
@@ -153,9 +150,7 @@ const isPremium = (status, end) => {
 
 async function userHasActivePremium(userId) {
   const orgs = await prisma.org.findMany({
-    where: {
-      OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-    },
+    where: { OR: [{ ownerUserId: userId }, { members: { some: { userId } } }] },
     select: {
       id: true,
       subscriptions: {
@@ -356,9 +351,7 @@ async function getEntitlementsPayload(userId) {
 
   // Grab all orgs this user touches
   let orgsRaw = await prisma.org.findMany({
-    where: {
-      OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-    },
+    where: { OR: [{ ownerUserId: userId }, { members: { some: { userId } } }] },
     select: {
       id: true, name: true, stripeCustomerId: true,
       subscriptions: {
@@ -373,36 +366,27 @@ async function getEntitlementsPayload(userId) {
   const hasPremiumNow = orgsRaw.some(o => {
     const s = o.subscriptions?.[0];
     return s && isPremium(s.status, s.currentPeriodEnd);
-    });
+  });
 
   // BROADENED SELF-HEAL: if no premium seen, try Stripe by email, and sync
   if (!hasPremiumNow && user?.email) {
     try {
-      const search = await stripe.customers.search({
-        query: `email:"${user.email}"`,
-      });
+      const search = await stripe.customers.search({ query: `email:"${user.email}"` });
       const cust = search?.data?.[0];
       if (cust) {
-        // Find or create org linked to customer
         const org = await ensureOrgAndMember({
           userId,
           customerId: cust.id,
           customerName: cust.name,
           email: user.email
         });
-
-        // Pull the latest sub (if any) and upsert
         const subs = await stripe.subscriptions.list({ customer: cust.id, limit: 1 });
         const sub = subs?.data?.[0];
-        if (sub) {
-          await upsertSubscription({ orgId: org.id, sub });
-        }
+        if (sub) await upsertSubscription({ orgId: org.id, sub });
 
-        // Refresh local view
+        // Refresh local snapshot
         orgsRaw = await prisma.org.findMany({
-          where: {
-            OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-          },
+          where: { OR: [{ ownerUserId: userId }, { members: { some: { userId } } }] },
           select: {
             id: true, name: true, stripeCustomerId: true,
             subscriptions: {
@@ -442,26 +426,22 @@ app.get('/entitlements', auth, async (req, res) => {
 
 // ---------- Billing ----------
 
-// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY)
-// Blocks if an account already exists for that email.
+// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY) — blocks if a user already exists
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
     if (!isEmail(email)) return res.status(400).json({ error: 'email required' });
 
     const existing = await prisma.user.findUnique({ where: { email } });
-    if (existing) {
-      return res.status(400).json({ error: 'account_exists' });
-    }
+    if (existing) return res.status(400).json({ error: 'account_exists' });
 
     const successUrl = (returnUrl && String(returnUrl)) || 'https://www.nerdherdmc.net/new-account';
     const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_creation: 'always',
-      customer_email: email,
-      line_items: [{ price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      customer_email: email,          // no customer_creation in subscription mode
+      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
       success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: cancelUrl,
       allow_promotion_codes: true,
@@ -474,32 +454,44 @@ app.post('/billing/checkout_public', async (req, res) => {
   }
 });
 
-// POST /billing/checkout_renew
-app.post('/billing/checkout_renew', authenticateToken, async (req, res) => {
+// AUTH’D RENEW CHECKOUT (ONLY WHEN NO ACTIVE PREMIUM)
+app.post('/billing/checkout_renew', auth, async (req, res) => {
   try {
-    const userId = req.user?.id;
-    if (!userId) {
-      console.warn('[checkout_renew] No userId in token');
-      return res.status(401).json({ error: 'Unauthorized' });
+    const userId = req.user.sub;
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user?.email) return res.status(400).json({ error: 'missing_email' });
+
+    // If already premium, block renew
+    if (await userHasActivePremium(userId)) {
+      return res.status(400).json({ error: 'already_active' });
     }
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user?.email) throw new Error('User not found');
+    // Try to reuse a known customer if any org has it
+    const org = await prisma.org.findFirst({
+      where: {
+        OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
+        stripeCustomerId: { not: null }
+      },
+      select: { stripeCustomerId: true }
+    });
+    const customerId = org?.stripeCustomerId || null;
+
+    const successUrl = 'https://www.nerdherdmc.net/accounts'; // after renew, go back to accounts
+    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: user.email,
-      line_items: [
-        { price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }
-      ],
-      success_url: 'https://www.nerdherdmc.net/account?renew_success=true',
-      cancel_url:  'https://www.nerdherdmc.net/account?renew_cancel=true',
+      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      ...(customerId ? { customer: customerId } : { customer_email: user.email }),
+      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl,
+      allow_promotion_codes: true,
     });
 
     return res.json({ url: session.url });
-  } catch (err) {
-    console.error('[checkout_renew] error:', err);
-    return res.status(500).json({ error: 'Renewal checkout failed' });
+  } catch (e) {
+    console.error('[checkout_renew] error:', e);
+    return res.status(500).json({ error: 'Checkout failed' });
   }
 });
 
@@ -520,9 +512,6 @@ app.get('/billing/price_check', async (_req, res) => {
     res.status(500).json({ error: e?.message || 'price check failed' });
   }
 });
-
-app.get('/billing/success', (_req, res) => res.send('Payment success\nYou can close this tab.'));
-app.get('/billing/cancel',  (_req, res) => res.send('Payment canceled'));
 
 // ---------- Stripe webhooks ----------
 app.post('/webhooks/stripe', async (req, res) => {
