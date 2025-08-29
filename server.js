@@ -100,6 +100,36 @@ let transporter = null;
   }
 })();
 
+// helper: return a valid Stripe customer id for this user (or null)
+async function getValidCustomerIdForUser(userId, email) {
+  // Find any org with a stored customer id
+  const org = await prisma.org.findFirst({
+    where: {
+      OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
+      stripeCustomerId: { not: null }
+    },
+    select: { id: true, stripeCustomerId: true }
+  });
+
+  if (!org?.stripeCustomerId) return null;
+
+  // Verify the id still exists in Stripe (it may have been deleted during tests)
+  const cust = await getStripeCustomer(org.stripeCustomerId);
+  if (cust && !cust.deleted) return org.stripeCustomerId;
+
+  // Stale id -> clean it up to avoid future failures
+  try {
+    await prisma.org.update({
+      where: { id: org.id },
+      data: { stripeCustomerId: null }
+    });
+    console.warn('[renew] cleared stale stripeCustomerId on org', org.id, 'for', email);
+  } catch (e) {
+    console.warn('[renew] failed to clear stale stripeCustomerId:', e?.message || e);
+  }
+  return null;
+}
+
 // ---------- one-time token helpers ----------
 async function invalidateTokensFor(userId, purpose) {
   await prisma.passwordToken.updateMany({
@@ -466,25 +496,17 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
       return res.status(400).json({ error: 'already_active' });
     }
 
-    // Try to reuse a known customer if any org has it
-    const org = await prisma.org.findFirst({
-      where: {
-        OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
-        stripeCustomerId: { not: null }
-      },
-      select: { stripeCustomerId: true }
-    });
-    const customerId = org?.stripeCustomerId || null;
-
-    const successUrl = 'https://www.nerdherdmc.net/accounts'; // after renew, go back to accounts
-    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
+    // Get a *verified* existing customer id if we have one
+    const verifiedCustomerId = await getValidCustomerIdForUser(userId, user.email);
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      ...(customerId ? { customer: customerId } : { customer_email: user.email }),
-      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: cancelUrl,
+      line_items: [{ price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      ...(verifiedCustomerId
+        ? { customer: verifiedCustomerId }
+        : { customer_creation: 'always', customer_email: user.email }),
+      success_url: 'https://www.nerdherdmc.net/accounts?renew=success&sid={CHECKOUT_SESSION_ID}',
+      cancel_url: 'https://www.nerdherdmc.net/accounts?renew=cancel',
       allow_promotion_codes: true,
     });
 
@@ -494,6 +516,7 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
     return res.status(500).json({ error: 'Checkout failed' });
   }
 });
+
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
