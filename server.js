@@ -1,4 +1,4 @@
-// server.js
+F// server.js
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -490,26 +490,34 @@ app.post('/billing/checkout_public', async (req, res) => {
 app.post('/billing/checkout_renew', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
-    const user   = await prisma.user.findUnique({ where: { id: userId } });
+    const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user?.email) return res.status(400).json({ error: 'missing_email' });
 
+    // If already premium, block renew
     if (await userHasActivePremium(userId)) {
       return res.status(400).json({ error: 'already_active' });
     }
 
-    // try to reuse existing org.customer if it still exists in Stripe
+    // Try to reuse existing customer
     let customerId = null;
     const org = await prisma.org.findFirst({
-      where: { OR: [{ ownerUserId: userId }, { members: { some: { userId } } }], stripeCustomerId: { not: null } },
-      select: { stripeCustomerId: true }
+      where: {
+        OR: [{ ownerUserId: userId }, { members: { some: { userId } } }],
+        stripeCustomerId: { not: null }
+      },
+      select: { id: true, stripeCustomerId: true }
     });
-    if (org?.stripeCustomerId) {
-      const exists = await safeGetCustomer(org.stripeCustomerId);
-      if (exists) customerId = org.stripeCustomerId;
-    }
 
-    const successUrl = 'https://www.nerdherdmc.net/new-account';
-    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
+    if (org?.stripeCustomerId) {
+      // Verify with Stripe
+      const cust = await getStripeCustomer(org.stripeCustomerId);
+      if (cust && !cust.deleted) {
+        customerId = cust.id;
+      } else {
+        // self-heal: clear invalid ID
+        await prisma.org.update({ where: { id: org.id }, data: { stripeCustomerId: null } });
+      }
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -517,17 +525,18 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
       ...(customerId
         ? { customer: customerId }
         : { customer_creation: 'always', customer_email: user.email }),
-      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: cancelUrl,
+      success_url: `https://www.nerdherdmc.net/accounts?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `https://www.nerdherdmc.net/accounts`,
       allow_promotion_codes: true,
     });
 
-    return res.json({ url: session.url });
+    res.json({ url: session.url });
   } catch (e) {
     console.error('[checkout_renew] error:', e);
-    return res.status(500).json({ error: 'checkout_failed' });
+    res.status(500).json({ error: 'Checkout failed', detail: e?.message });
   }
 });
+
 
 // Client-side finalizer that you call after Stripe returns (idempotent)
 app.post('/billing/checkout_sync', auth, async (req, res) => {
