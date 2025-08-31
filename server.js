@@ -455,50 +455,49 @@ app.get('/entitlements', auth, async (req, res) => {
 });
 
 // ---------- Billing ----------
-
-// Public checkout (block if account already exists)
 app.post('/billing/checkout_public', async (req, res) => {
   try {
-    const em = normEmail(req.body?.email);
-    const returnUrl = String(req.body?.returnUrl || '');
-    if (!isEmail(em)) return res.status(400).json({ error: 'bad_email' });
+    const { email, returnUrl } = req.body || {};
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'invalid_email' });
+    }
 
-    const existing = await prisma.user.findUnique({ where: { email: em } });
-    if (existing) return res.status(400).json({ error: 'account_exists' });
-
-    const successUrl = returnUrl || 'https://www.nerdherdmc.net/new-account';
-    const cancelUrl  = 'https://www.nerdherdmc.net/accounts';
+    // If an account already exists with a password set, block “new” checkout
+    const existing = await prisma.user.findUnique({ where: { email: email.toLowerCase().trim() }});
+    if (existing?.passwordHash) {
+      return res.status(409).json({ error: 'account_exists' });
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_creation: 'always',
-      customer_email: em,
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url:  cancelUrl,
+      customer_creation: 'always',          // always create Stripe Customer for new emails
+      customer_email: email,
+      success_url: (returnUrl || 'https://www.nerdherdmc.net/new-account') + '?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: 'https://www.nerdherdmc.net/accounts',
       allow_promotion_codes: true,
     });
 
     return res.json({ url: session.url });
   } catch (e) {
     console.error('[checkout_public] error:', e);
-    return res.status(500).json({ error: 'checkout_failed' });
+    return res.status(500).json({ error: 'stripe_error', detail: e?.message });
   }
 });
 
+
 // Auth’d renew (only when not currently premium). Never use a stale customer id.
-app.post('/billing/checkout_renew', auth, async (req, res) => {
+app.post('/billing/checkout_renew', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.sub;
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user?.email) return res.status(400).json({ error: 'missing_email' });
 
-    // If already premium, block renew
     if (await userHasActivePremium(userId)) {
       return res.status(400).json({ error: 'already_active' });
     }
 
-    // Try to reuse existing customer
+    // Try to reuse a valid Stripe customer, else clear and create fresh
     let customerId = null;
     const org = await prisma.org.findFirst({
       where: {
@@ -509,12 +508,13 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
     });
 
     if (org?.stripeCustomerId) {
-      // Verify with Stripe
-      const cust = await getStripeCustomer(org.stripeCustomerId);
-      if (cust && !cust.deleted) {
-        customerId = cust.id;
-      } else {
-        // self-heal: clear invalid ID
+      try {
+        const cust = await stripe.customers.retrieve(org.stripeCustomerId);
+        if (!cust?.deleted) customerId = cust.id; else {
+          await prisma.org.update({ where: { id: org.id }, data: { stripeCustomerId: null } });
+        }
+      } catch {
+        // stale ID; clear
         await prisma.org.update({ where: { id: org.id }, data: { stripeCustomerId: null } });
       }
     }
@@ -525,15 +525,15 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
       ...(customerId
         ? { customer: customerId }
         : { customer_creation: 'always', customer_email: user.email }),
-      success_url: `https://www.nerdherdmc.net/accounts?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `https://www.nerdherdmc.net/accounts`,
+      success_url: 'https://www.nerdherdmc.net/accounts?session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: 'https://www.nerdherdmc.net/accounts',
       allow_promotion_codes: true,
     });
 
-    res.json({ url: session.url });
+    return res.json({ url: session.url });
   } catch (e) {
     console.error('[checkout_renew] error:', e);
-    res.status(500).json({ error: 'Checkout failed', detail: e?.message });
+    return res.status(500).json({ error: 'stripe_error', detail: e?.message });
   }
 });
 
