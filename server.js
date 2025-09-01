@@ -1,4 +1,4 @@
-F// server.js
+// server.js
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
