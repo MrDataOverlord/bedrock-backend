@@ -7,6 +7,7 @@ import bcrypt from 'bcryptjs';
 import nodemailer from 'nodemailer';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
 import { PrismaClient } from '@prisma/client';
 
 // ---------- env ----------
@@ -35,6 +36,12 @@ if (!STRIPE_PRICE_PREMIUM) throw new Error('STRIPE_PRICE_PREMIUM is required');
 // ---------- init ----------
 const app = express();
 app.set('trust proxy', 1);
+
+// Add security headers
+app.use(helmet({
+  contentSecurityPolicy: false, // Allow for flexibility with Wix integration
+  crossOriginEmbedderPolicy: false
+}));
 
 const prisma = new PrismaClient();
 const stripe = new Stripe(STRIPE_SECRET_KEY);
@@ -87,7 +94,7 @@ function auth(req, res, next) {
 let transporter = null;
 (async () => {
   if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
-    transporter = nodemailer.createTransport({
+    transporter = nodemailer.createTransporter({
       host: SMTP_HOST,
       port: Number(SMTP_PORT || 465),
       secure: String(SMTP_SECURE || 'true') === 'true',
@@ -247,54 +254,77 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/auth/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user || !user.passwordHash) return res.status(401).json({ error: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password, user.passwordHash);
-  if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-  res.json({ access: signAccess(user) });
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase().trim() } });
+    if (!user || !user.passwordHash) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    res.json({ access: signAccess(user) });
+  } catch (e) {
+    console.error('[login] error:', e?.message || e);
+    res.status(500).json({ error: 'Login failed' });
+  }
 });
 
-// ----- Registration completion (token-anchored, ignores email) -----
+// ----- Registration completion (FIXED token validation) -----
 app.post('/auth/register/complete', async (req, res) => {
-  const { token, password } = req.body || {};
-  if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const { token, password } = req.body || {};
+    if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
 
-  const tok = await prisma.passwordToken.findFirst({
-    where: { purpose: 'register', usedAt: null, expiresAt: { gt: new Date() } },
-    orderBy: { createdAt: 'desc' },
-  });
-  if (!tok) return res.status(400).json({ error: 'Token not found or expired' });
+    // Get all unused registration tokens and find the matching one
+    const tokens = await prisma.passwordToken.findMany({
+      where: { purpose: 'register', usedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+    });
 
-  const ok = await bcrypt.compare(token, tok.tokenHash);
-  if (!ok) return res.status(400).json({ error: 'Invalid token' });
+    let validToken = null;
+    for (const tok of tokens) {
+      if (await bcrypt.compare(token, tok.tokenHash)) {
+        validToken = tok;
+        break;
+      }
+    }
 
-  const user = await prisma.user.findUnique({ where: { id: tok.userId } });
-  if (!user) return res.status(400).json({ error: 'User not found' });
-  if (user.passwordHash) return res.status(400).json({ error: 'Password already set' });
+    if (!validToken) return res.status(400).json({ error: 'Token not found or expired' });
 
-  const hash = await bcrypt.hash(password, 10);
-  await prisma.$transaction([
-    prisma.user.update({ where: { id: user.id }, data: { passwordHash: hash } }),
-    prisma.passwordToken.update({ where: { id: tok.id }, data: { usedAt: new Date() } }),
-  ]);
+    const user = await prisma.user.findUnique({ where: { id: validToken.userId } });
+    if (!user) return res.status(400).json({ error: 'User not found' });
+    if (user.passwordHash) return res.status(400).json({ error: 'Password already set' });
 
-  res.json({ ok: true });
+    const hash = await bcrypt.hash(password, 10);
+    await prisma.$transaction([
+      prisma.user.update({ where: { id: user.id }, data: { passwordHash: hash } }),
+      prisma.passwordToken.update({ where: { id: validToken.id }, data: { usedAt: new Date() } }),
+    ]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[register/complete] error:', e?.message || e);
+    res.status(500).json({ error: 'Registration failed' });
+  }
 });
 
 // ----- Resend registration email (if no password yet) -----
 app.post('/auth/register/resend', async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) return res.status(400).json({ error: 'Missing email' });
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Missing email' });
 
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) return res.status(200).json({ ok: true });
-  if (user.passwordHash) return res.status(200).json({ ok: true, note: 'already_has_password' });
+    const cleanEmail = email.toLowerCase().trim();
+    const user = await prisma.user.findUnique({ where: { email: cleanEmail } });
+    if (!user) return res.status(200).json({ ok: true });
+    if (user.passwordHash) return res.status(200).json({ ok: true, note: 'already_has_password' });
 
-  const raw = await issueRegistrationToken(user.id);
-  await sendRegistrationEmail(user.email, raw);
-  res.json({ ok: true });
+    const raw = await issueRegistrationToken(user.id);
+    await sendRegistrationEmail(user.email, raw);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[register/resend] error:', e?.message || e);
+    res.status(500).json({ error: 'Resend failed' });
+  }
 });
 
 // ----- Manual start registration (recovery path / resend button) -----
@@ -303,8 +333,9 @@ app.post('/auth/register/start', async (req, res) => {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Missing email' });
 
-    let user = await prisma.user.findUnique({ where: { email } });
-    if (!user) user = await prisma.user.create({ data: { email } });
+    const cleanEmail = email.toLowerCase().trim();
+    let user = await prisma.user.findUnique({ where: { email: cleanEmail } });
+    if (!user) user = await prisma.user.create({ data: { email: cleanEmail } });
 
     if (user.passwordHash) {
       return res.json({ ok: true, note: 'already_has_password' });
@@ -321,35 +352,41 @@ app.post('/auth/register/start', async (req, res) => {
 
 // ----- Forgot password (start) -----
 app.post('/auth/reset/start', async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) return res.status(400).json({ error: 'Missing email' });
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'Missing email' });
 
-  const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) return res.json({ ok: true });
+    const cleanEmail = email.toLowerCase().trim();
+    const user = await prisma.user.findUnique({ where: { email: cleanEmail } });
+    if (!user) return res.json({ ok: true }); // Don't reveal if email exists
 
-  await invalidateTokensFor(user.id, 'reset');
+    await invalidateTokensFor(user.id, 'reset');
 
-  const raw = crypto.randomBytes(32).toString('hex');
-  const tokenHash = await bcrypt.hash(raw, 10);
-  const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24);
-  await prisma.passwordToken.create({
-    data: { userId: user.id, tokenHash, purpose: 'reset', expiresAt },
-  });
-
-  if (transporter) {
-    const base = (REG_URL_BASE || '').replace(/\/+$/, '');
-    const url = `${base}?token=${encodeURIComponent(raw)}&email=${encodeURIComponent(email)}&mode=reset`;
-    await transporter.sendMail({
-      from: SMTP_USER,
-      to: email,
-      subject: 'Reset your Bedrock Utilities password',
-      html: `<p>Click to reset your password:</p><p><a href="${url}">${url}</a></p>`,
+    const raw = crypto.randomBytes(32).toString('hex');
+    const tokenHash = await bcrypt.hash(raw, 10);
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24);
+    await prisma.passwordToken.create({
+      data: { userId: user.id, tokenHash, purpose: 'reset', expiresAt },
     });
-  } else {
-    log('[mail] reset requested but SMTP not configured');
-  }
 
-  res.json({ ok: true });
+    if (transporter) {
+      const base = (REG_URL_BASE || '').replace(/\/+$/, '');
+      const url = `${base}?token=${encodeURIComponent(raw)}&email=${encodeURIComponent(cleanEmail)}&mode=reset`;
+      await transporter.sendMail({
+        from: SMTP_USER,
+        to: cleanEmail,
+        subject: 'Reset your Bedrock Utilities password',
+        html: `<p>Click to reset your password:</p><p><a href="${url}">${url}</a></p>`,
+      });
+    } else {
+      log('[mail] reset requested but SMTP not configured');
+    }
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[reset/start] error:', e?.message || e);
+    res.status(500).json({ error: 'Reset failed' });
+  }
 });
 
 // ----- Forgot password (complete) – token-anchored -----
