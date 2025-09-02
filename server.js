@@ -389,27 +389,39 @@ app.post('/auth/reset/start', async (req, res) => {
   }
 });
 
-// ----- Forgot password (complete) – token-anchored -----
+// ----- Forgot password (complete) – FIXED token validation -----
 app.post('/auth/reset/complete', async (req, res) => {
-  const { token, newPassword } = req.body || {};
-  if (!token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
 
-  const tok = await prisma.passwordToken.findFirst({
-    where: { purpose: 'reset', usedAt: null, expiresAt: { gt: new Date() } },
-    orderBy: { createdAt: 'desc' },
-  });
-  if (!tok) return res.status(400).json({ error: 'Token not found or expired' });
+    // Get all unused reset tokens and find the matching one
+    const tokens = await prisma.passwordToken.findMany({
+      where: { purpose: 'reset', usedAt: null, expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'desc' },
+    });
 
-  const ok = await bcrypt.compare(token, tok.tokenHash);
-  if (!ok) return res.status(400).json({ error: 'Invalid token' });
+    let validToken = null;
+    for (const tok of tokens) {
+      if (await bcrypt.compare(token, tok.tokenHash)) {
+        validToken = tok;
+        break;
+      }
+    }
 
-  const hash = await bcrypt.hash(newPassword, 10);
-  await prisma.$transaction([
-    prisma.user.update({ where: { id: tok.userId }, data: { passwordHash: hash } }),
-    prisma.passwordToken.update({ where: { id: tok.id }, data: { usedAt: new Date() } }),
-  ]);
+    if (!validToken) return res.status(400).json({ error: 'Token not found or expired' });
 
-  res.json({ ok: true });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await prisma.$transaction([
+      prisma.user.update({ where: { id: validToken.userId }, data: { passwordHash: hash } }),
+      prisma.passwordToken.update({ where: { id: validToken.id }, data: { usedAt: new Date() } }),
+    ]);
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[reset/complete] error:', e?.message || e);
+    res.status(500).json({ error: 'Password reset failed' });
+  }
 });
 
 // ----- Entitlements (with broadened self-heal) -----
@@ -485,21 +497,33 @@ async function getEntitlementsPayload(userId) {
 }
 
 app.get('/account/me', auth, async (req, res) => {
-  res.json(await getEntitlementsPayload(req.user.sub));
+  try {
+    res.json(await getEntitlementsPayload(req.user.sub));
+  } catch (e) {
+    console.error('[account/me] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to get account info' });
+  }
 });
+
 app.get('/entitlements', auth, async (req, res) => {
-  res.json(await getEntitlementsPayload(req.user.sub));
+  try {
+    res.json(await getEntitlementsPayload(req.user.sub));
+  } catch (e) {
+    console.error('[entitlements] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to get entitlements' });
+  }
 });
 
 // ---------- Billing ----------
 
-// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY) — blocks if a user already exists
+// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY) – blocks if a user already exists
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
     if (!isEmail(email)) return res.status(400).json({ error: 'email required' });
 
-    const existing = await prisma.user.findUnique({ where: { email } });
+    const cleanEmail = email.toLowerCase().trim();
+    const existing = await prisma.user.findUnique({ where: { email: cleanEmail } });
     if (existing) return res.status(400).json({ error: 'account_exists' });
 
     const successUrl = (returnUrl && String(returnUrl)) || 'https://www.nerdherdmc.net/new-account';
@@ -507,7 +531,7 @@ app.post('/billing/checkout_public', async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: email,          // no customer_creation in subscription mode
+      customer_email: cleanEmail,
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
       success_url: `${successUrl}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: cancelUrl,
@@ -521,7 +545,7 @@ app.post('/billing/checkout_public', async (req, res) => {
   }
 });
 
-// AUTH’D RENEW CHECKOUT (ONLY WHEN NO ACTIVE PREMIUM)
+// AUTH'D RENEW CHECKOUT (ONLY WHEN NO ACTIVE PREMIUM)
 app.post('/billing/checkout_renew', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -538,11 +562,11 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      line_items: [{ price: process.env.STRIPE_PRICE_PREMIUM, quantity: 1 }],
+      line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
       ...(verifiedCustomerId
         ? { customer: verifiedCustomerId }
         : { customer_creation: 'always', customer_email: user.email }),
-      success_url: 'https://www.nerdherdmc.net/accounts?renew=success&sid={CHECKOUT_SESSION_ID}',
+      success_url: 'https://www.nerdherdmc.net/accounts?renew=success&session_id={CHECKOUT_SESSION_ID}',
       cancel_url: 'https://www.nerdherdmc.net/accounts?renew=cancel',
       allow_promotion_codes: true,
     });
@@ -553,7 +577,6 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
     return res.status(500).json({ error: 'Checkout failed' });
   }
 });
-
 
 // ----- Price sanity check -----
 app.get('/billing/price_check', async (_req, res) => {
@@ -597,16 +620,18 @@ app.post('/webhooks/stripe', async (req, res) => {
 
         if (!email) break;
 
+        const cleanEmail = email.toLowerCase().trim();
+
         // Ensure user
-        let user = await prisma.user.findUnique({ where: { email } });
-        if (!user) user = await prisma.user.create({ data: { email } });
+        let user = await prisma.user.findUnique({ where: { email: cleanEmail } });
+        if (!user) user = await prisma.user.create({ data: { email: cleanEmail } });
 
         // Registration mail if needed
         if (!user.passwordHash) {
           try {
             const rawTok = await issueRegistrationToken(user.id);
-            await sendRegistrationEmail(email, rawTok);
-            console.log('[webhook] registration email queued to:', email);
+            await sendRegistrationEmail(cleanEmail, rawTok);
+            console.log('[webhook] registration email queued to:', cleanEmail);
           } catch (mailErr) {
             console.error('[webhook] email send failed:', mailErr?.message || mailErr);
           }
@@ -617,7 +642,7 @@ app.post('/webhooks/stripe', async (req, res) => {
         if (customerId) {
           const cust = await getStripeCustomer(customerId);
           const org = await ensureOrgAndMember({
-            userId: user.id, customerId, customerName: cust?.name, email
+            userId: user.id, customerId, customerName: cust?.name, email: cleanEmail
           });
 
           if (s.subscription) {
@@ -638,7 +663,7 @@ app.post('/webhooks/stripe', async (req, res) => {
         if (!customerId) break;
 
         const cust = await getStripeCustomer(customerId);
-        const email = cust?.email;
+        const email = cust?.email?.toLowerCase()?.trim();
 
         let user = email ? await prisma.user.findUnique({ where: { email } }) : null;
         if (!user && email) user = await prisma.user.create({ data: { email } });
