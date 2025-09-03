@@ -695,6 +695,180 @@ app.post('/webhooks/stripe', async (req, res) => {
   res.json({ received: true });
 });
 
+// ---------- Premium Features (Server-Side Validation) ----------
+
+// Get user's notification settings
+app.get('/premium/notifications/settings', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Get or create default notification settings
+    let settings = await prisma.notificationSettings.findUnique({
+      where: { userId },
+      include: { rules: true }
+    });
+
+    if (!settings) {
+      // Create default settings with common notification rules
+      settings = await prisma.notificationSettings.create({
+        data: {
+          userId,
+          soundEnabled: false,
+          rules: {
+            create: [
+              {
+                name: 'Player Join',
+                type: 'contains',
+                pattern: 'joined the game',
+                soundFile: 'player_join.wav',
+                enabled: true
+              },
+              {
+                name: 'Player Leave', 
+                type: 'contains',
+                pattern: 'left the game',
+                soundFile: 'player_leave.wav',
+                enabled: true
+              },
+              {
+                name: 'Error Alert',
+                type: 'regex',
+                pattern: '\\b(ERROR|FATAL)\\b',
+                soundFile: 'error_alert.wav',
+                enabled: true
+              },
+              {
+                name: 'Warning Alert',
+                type: 'contains',
+                pattern: 'WARN',
+                soundFile: 'warning.wav',
+                enabled: true
+              },
+              {
+                name: 'Server Crash',
+                type: 'contains',
+                pattern: 'FAIL',
+                soundFile: 'critical_alert.wav',
+                enabled: true
+              }
+            ]
+          }
+        },
+        include: { rules: true }
+      });
+    }
+
+    res.json({
+      soundEnabled: settings.soundEnabled,
+      rules: {
+        rules: settings.rules.map(rule => ({
+          name: rule.name,
+          type: rule.type,
+          pattern: rule.pattern,
+          soundFile: rule.soundFile,
+          enabled: rule.enabled
+        }))
+      }
+    });
+  } catch (e) {
+    console.error('[premium/notifications/settings] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to get notification settings' });
+  }
+});
+
+// Enable/disable sound notifications
+app.post('/premium/notifications/sound', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { enabled } = req.body || {};
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    await prisma.notificationSettings.upsert({
+      where: { userId },
+      create: { userId, soundEnabled: Boolean(enabled) },
+      update: { soundEnabled: Boolean(enabled) }
+    });
+
+    res.json({ ok: true, enabled: Boolean(enabled) });
+  } catch (e) {
+    console.error('[premium/notifications/sound] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to update notification settings' });
+  }
+});
+
+// Serve sound files (premium only)
+app.get('/premium/sounds/:filename', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { filename } = req.params;
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Validate filename for security
+    if (!/^[a-zA-Z0-9_-]+\.(wav|mp3)$/.test(filename)) {
+      return res.status(400).json({ error: 'Invalid filename' });
+    }
+
+    // Serve from sounds directory (you'll need to add sound files here)
+    const soundPath = path.join(process.cwd(), 'sounds', filename);
+    
+    // Check if file exists
+    if (!require('fs').existsSync(soundPath)) {
+      return res.status(404).json({ error: 'Sound file not found' });
+    }
+
+    res.sendFile(soundPath);
+  } catch (e) {
+    console.error('[premium/sounds] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to serve sound file' });
+  }
+});
+
+// Report notification trigger (analytics)
+app.post('/premium/notifications/trigger', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { rule, timestamp, lineLength } = req.body || {};
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Store trigger event for analytics (optional)
+    await prisma.notificationTrigger.create({
+      data: {
+        userId,
+        ruleName: String(rule || 'unknown'),
+        triggeredAt: timestamp ? new Date(timestamp) : new Date(),
+        lineLength: Number(lineLength || 0)
+      }
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[premium/notifications/trigger] error:', e?.message || e);
+    // Don't return error - this is fire-and-forget analytics
+    res.json({ ok: true });
+  }
+});
+
 // ---------- start ----------
 app.listen(PORT, () => {
   log(`API up on :${PORT}`);
