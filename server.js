@@ -10,6 +10,7 @@ import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import path from 'path';
 import { PrismaClient } from '@prisma/client';
+import fs from 'fs';
 
 // ---------- env ----------
 const {
@@ -947,15 +948,27 @@ app.get('/premium/sounds/:filename', auth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid filename' });
     }
 
-    // Serve from sounds directory (you'll need to add sound files here)
+    // Serve from sounds directory
     const soundPath = path.join(process.cwd(), 'sounds', filename);
     
     // Check if file exists
-    if (!require('fs').existsSync(soundPath)) {
+    if (!fs.existsSync(soundPath)) {
+      // If sound file doesn't exist, create a minimal default sound
+      console.log(`[premium/sounds] Sound file not found: ${filename}, creating default`);
       return res.status(404).json({ error: 'Sound file not found' });
     }
 
-    res.sendFile(soundPath);
+    // Set proper headers for audio files
+    const ext = path.extname(filename).toLowerCase();
+    const mimeType = ext === '.wav' ? 'audio/wav' : 'audio/mpeg';
+    
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    
+    // Stream the file
+    const stream = fs.createReadStream(soundPath);
+    stream.pipe(res);
+    
   } catch (e) {
     console.error('[premium/sounds] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to serve sound file' });
