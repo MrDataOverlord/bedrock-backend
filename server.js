@@ -694,6 +694,7 @@ app.post('/webhooks/stripe', async (req, res) => {
 
   res.json({ received: true });
 });
+
 // ---------- Premium Features (Server-Side Validation) ----------
 
 // Get user's notification settings
@@ -901,7 +902,7 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
     console.error('[premium/notifications/reset] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to reset notification rules' });
   }
-
+}); 
 // Enable/disable sound notifications
 app.post('/premium/notifications/sound', auth, async (req, res) => {
   try {
