@@ -694,7 +694,6 @@ app.post('/webhooks/stripe', async (req, res) => {
 
   res.json({ received: true });
 });
-
 // ---------- Premium Features (Server-Side Validation) ----------
 
 // Get user's notification settings
@@ -781,6 +780,127 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
     res.status(500).json({ error: 'Failed to get notification settings' });
   }
 });
+
+// Update a specific notification rule
+app.post('/premium/notifications/rule', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { name, type, pattern, soundFile, enabled } = req.body || {};
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Get user's notification settings
+    const settings = await prisma.notificationSettings.findUnique({
+      where: { userId },
+      include: { rules: true }
+    });
+
+    if (!settings) {
+      return res.status(404).json({ error: 'Notification settings not found' });
+    }
+
+    // Find and update the rule
+    const rule = settings.rules.find(r => r.name === name);
+    if (!rule) {
+      return res.status(404).json({ error: 'Notification rule not found' });
+    }
+
+    await prisma.notificationRule.update({
+      where: { id: rule.id },
+      data: {
+        type: type || rule.type,
+        pattern: pattern || rule.pattern,
+        soundFile: soundFile || rule.soundFile,
+        enabled: enabled !== undefined ? enabled : rule.enabled
+      }
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[premium/notifications/rule] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to update notification rule' });
+  }
+});
+
+// Reset notification rules to defaults
+app.post('/premium/notifications/reset', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Delete existing settings and recreate with defaults
+    await prisma.notificationSettings.deleteMany({
+      where: { userId }
+    });
+
+    // Create default settings
+    await prisma.notificationSettings.create({
+      data: {
+        userId,
+        soundEnabled: false,
+        rules: {
+          create: [
+            {
+              name: 'Player Join',
+              type: 'contains',
+              pattern: 'joined the game',
+              soundFile: 'player_join.wav',
+              enabled: true
+            },
+            {
+              name: 'Player Leave', 
+              type: 'contains',
+              pattern: 'left the game',
+              soundFile: 'player_leave.wav',
+              enabled: true
+            },
+            {
+              name: 'Error Alert',
+              type: 'regex',
+              pattern: '\\b(ERROR|FATAL)\\b',
+              soundFile: 'error_alert.wav',
+              enabled: true
+            },
+            {
+              name: 'Warning Alert',
+              type: 'contains',
+              pattern: 'WARN',
+              soundFile: 'warning.wav',
+              enabled: true
+            },
+            {
+              name: 'Server Crash',
+              type: 'contains',
+              pattern: 'FAIL',
+              soundFile: 'critical_alert.wav',
+              enabled: true
+            },
+            {
+              name: 'Server Stop',
+              type: 'contains',
+              pattern: 'Stopping server',
+              soundFile: 'server_stop.wav',
+              enabled: true
+            }
+          ]
+        }
+      }
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[premium/notifications/reset] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to reset notification rules' });
+  }
 
 // Enable/disable sound notifications
 app.post('/premium/notifications/sound', auth, async (req, res) => {
