@@ -30,6 +30,10 @@ model User {
   ownedOrgs      Org[]
   memberships    Member[]
   passwordTokens PasswordToken[]
+  
+  // Premium notification relations
+  notificationSettings NotificationSettings?
+  notificationTriggers NotificationTrigger[]
 }
 
 model Org {
@@ -102,9 +106,8 @@ model Subscription {
   @@index([provider])
 }
 
-
 // =======================
-// Premium Features -  Server Side Validation
+// Premium Features - Server Side Validation
 // =======================
 
 model NotificationSettings {
