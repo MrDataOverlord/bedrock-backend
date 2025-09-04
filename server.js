@@ -8,6 +8,7 @@ import nodemailer from 'nodemailer';
 import Stripe from 'stripe';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
+import path from 'path';
 import { PrismaClient } from '@prisma/client';
 
 // ---------- env ----------
@@ -94,7 +95,7 @@ function auth(req, res, next) {
 let transporter = null;
 (async () => {
   if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
-    transporter = nodemailer.createTransport({
+    transporter = nodemailer.createTransporter({
       host: SMTP_HOST,
       port: Number(SMTP_PORT || 465),
       secure: String(SMTP_SECURE || 'true') === 'true',
@@ -902,7 +903,8 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
     console.error('[premium/notifications/reset] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to reset notification rules' });
   }
-}); 
+});
+
 // Enable/disable sound notifications
 app.post('/premium/notifications/sound', auth, async (req, res) => {
   try {
