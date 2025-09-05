@@ -103,17 +103,17 @@ function createDefaultNotificationRules() {
       enabled: true
     },
     {
+      name: 'Player Spawn',
+      type: 'contains', 
+      pattern: 'Player Spawned:',
+      soundFile: 'player_spawn.wav',
+      enabled: false // Disabled by default to avoid double notifications
+    },
+    {
       name: 'Player Leave', 
       type: 'contains',
       pattern: 'Player disconnected:',
       soundFile: 'player_leave.wav',
-      enabled: true
-    },
-    {
-      name: 'Player Spawn',
-      type: 'contains', 
-      pattern: 'Player Spawned:',
-      soundFile: 'player_join.wav',
       enabled: true
     },
     {
@@ -736,6 +736,94 @@ app.get('/entitlements', auth, async (req, res) => {
   } catch (e) {
     console.error('[entitlements] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to get entitlements' });
+  }
+});
+
+app.get('/premium/sounds', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Ensure sounds directory exists
+    const soundsDir = path.join(process.cwd(), 'sounds');
+    if (!fs.existsSync(soundsDir)) {
+      fs.mkdirSync(soundsDir, { recursive: true });
+    }
+
+    // Read all sound files from the directory
+    const files = fs.readdirSync(soundsDir)
+      .filter(file => /\.(wav|mp3|ogg)$/i.test(file))
+      .map(file => ({
+        filename: file,
+        displayName: file.replace(/\.(wav|mp3|ogg)$/i, '').replace(/[_-]/g, ' '),
+        size: fs.statSync(path.join(soundsDir, file)).size
+      }))
+      .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+    console.log(`[premium/sounds] Found ${files.length} sound files`);
+
+    // Add default files if directory is empty
+    if (files.length === 0) {
+      const defaultSounds = [
+        'player_join.wav',
+        'player_leave.wav', 
+        'player_spawn.wav',
+        'error_alert.wav',
+        'warning.wav',
+        'critical_alert.wav',
+        'server_stop.wav',
+        'default.wav'
+      ];
+
+      console.log('[premium/sounds] Creating default sound files...');
+
+      // Create minimal WAV files for each default sound
+      const wavHeader = Buffer.from([
+        0x52, 0x49, 0x46, 0x46, // "RIFF"
+        0x24, 0x00, 0x00, 0x00, // File size - 8
+        0x57, 0x41, 0x56, 0x45, // "WAVE"
+        0x66, 0x6D, 0x74, 0x20, // "fmt "
+        0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
+        0x01, 0x00,             // AudioFormat (1 for PCM)
+        0x01, 0x00,             // NumChannels (1 = mono)
+        0x44, 0xAC, 0x00, 0x00, // SampleRate (44100)
+        0x44, 0xAC, 0x00, 0x00, // ByteRate
+        0x01, 0x00,             // BlockAlign
+        0x08, 0x00,             // BitsPerSample (8)
+        0x64, 0x61, 0x74, 0x61, // "data"
+        0x00, 0x00, 0x00, 0x00  // Subchunk2Size (0 = no audio data)
+      ]);
+
+      for (const soundFile of defaultSounds) {
+        const soundPath = path.join(soundsDir, soundFile);
+        if (!fs.existsSync(soundPath)) {
+          fs.writeFileSync(soundPath, wavHeader);
+        }
+      }
+
+      // Re-read the directory after creating defaults
+      const newFiles = fs.readdirSync(soundsDir)
+        .filter(file => /\.(wav|mp3|ogg)$/i.test(file))
+        .map(file => ({
+          filename: file,
+          displayName: file.replace(/\.(wav|mp3|ogg)$/i, '').replace(/[_-]/g, ' '),
+          size: fs.statSync(path.join(soundsDir, file)).size
+        }))
+        .sort((a, b) => a.displayName.localeCompare(b.displayName));
+
+      return res.json({ sounds: newFiles });
+    }
+
+    res.json({ sounds: files });
+
+  } catch (e) {
+    console.error('[premium/sounds] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to list sound files' });
   }
 });
 
