@@ -1032,44 +1032,6 @@ app.get('/premium/sounds/:filename', auth, async (req, res) => {
   }
 });
 
-// Report notification trigger (analytics)
-app.post('/premium/notifications/trigger', auth, async (req, res) => {
-  try {
-    const userId = req.user.sub;
-    const { rule, timestamp, lineLength } = req.body || {};
-
-    // Verify premium status
-    const hasPremium = await userHasActivePremium(userId);
-    if (!hasPremium) {
-      return res.status(403).json({ error: 'Premium subscription required' });
-    }
-
-    // Store trigger event for analytics (optional)
-    await prisma.notificationTrigger.create({
-      data: {
-        userId,
-        ruleName: String(rule || 'unknown'),
-        triggeredAt: timestamp ? new Date(timestamp) : new Date(),
-        lineLength: Number(lineLength || 0)
-      }
-    });
-
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[premium/notifications/trigger] error:', e?.message || e);
-    // Don't return error - this is fire-and-forget analytics
-    res.json({ ok: true });
-  }
-});
-
-    console.log('[DEBUG] Sending response:', JSON.stringify(response, null, 2));
-    res.json(response);
-  } catch (e) {
-    console.error('[premium/notifications/settings] error:', e?.message || e);
-    res.status(500).json({ error: 'Failed to get notification settings' });
-  }
-});
-
 // ---------- start ----------
 app.listen(PORT, () => {
   log(`API up on :${PORT}`);
