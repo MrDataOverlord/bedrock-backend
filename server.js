@@ -92,6 +92,60 @@ function auth(req, res, next) {
   }
 }
 
+// Function to create default notification rules that match actual Bedrock server format
+function createDefaultNotificationRules() {
+  return [
+    {
+      name: 'Player Join',
+      type: 'contains',
+      pattern: 'Player connected:',
+      soundFile: 'player_join.wav',
+      enabled: true
+    },
+    {
+      name: 'Player Leave', 
+      type: 'contains',
+      pattern: 'Player disconnected:',
+      soundFile: 'player_leave.wav',
+      enabled: true
+    },
+    {
+      name: 'Player Spawn',
+      type: 'contains', 
+      pattern: 'Player Spawned:',
+      soundFile: 'player_join.wav',
+      enabled: true
+    },
+    {
+      name: 'Error Alert',
+      type: 'regex',
+      pattern: '\\b(ERROR|FATAL)\\b',
+      soundFile: 'error_alert.wav',
+      enabled: true
+    },
+    {
+      name: 'Warning Alert',
+      type: 'contains',
+      pattern: 'WARN',
+      soundFile: 'warning.wav',
+      enabled: true
+    },
+    {
+      name: 'Server Crash',
+      type: 'contains',
+      pattern: 'FAIL',
+      soundFile: 'critical_alert.wav',
+      enabled: true
+    },
+    {
+      name: 'Server Stop',
+      type: 'contains',
+      pattern: 'Stopping server',
+      soundFile: 'server_stop.wav',
+      enabled: true
+    }
+  ];
+}
 // ---------- SMTP ----------
 let transporter = null;
 (async () => {
@@ -700,7 +754,6 @@ app.post('/webhooks/stripe', async (req, res) => {
 // ---------- Premium Features (Server-Side Validation) ----------
 
 // Get user's notification settings
-// Get user's notification settings
 app.get('/premium/notifications/settings', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -723,50 +776,16 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
     console.log('[DEBUG] Found existing settings:', !!settings);
 
     if (!settings) {
-      console.log('[DEBUG] Creating default settings...');
-      // Create default settings with common notification rules
+      console.log('[DEBUG] Creating default settings with updated Bedrock patterns...');
+      
+      const defaultRules = createDefaultNotificationRules();
+      
       settings = await prisma.notificationSettings.create({
         data: {
           userId,
           soundEnabled: false,
           rules: {
-            create: [
-              {
-                name: 'Player Join',
-                type: 'contains',
-                pattern: 'joined the game',
-                soundFile: 'player_join.wav',
-                enabled: true
-              },
-              {
-                name: 'Player Leave', 
-                type: 'contains',
-                pattern: 'left the game',
-                soundFile: 'player_leave.wav',
-                enabled: true
-              },
-              {
-                name: 'Error Alert',
-                type: 'regex',
-                pattern: '\\b(ERROR|FATAL)\\b',
-                soundFile: 'error_alert.wav',
-                enabled: true
-              },
-              {
-                name: 'Warning Alert',
-                type: 'contains',
-                pattern: 'WARN',
-                soundFile: 'warning.wav',
-                enabled: true
-              },
-              {
-                name: 'Server Crash',
-                type: 'contains',
-                pattern: 'FAIL',
-                soundFile: 'critical_alert.wav',
-                enabled: true
-              }
-            ]
+            create: defaultRules
           }
         },
         include: { rules: true }
@@ -788,12 +807,11 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
 
     console.log('[DEBUG] Sending response:', JSON.stringify(response, null, 2));
     res.json(response);
-
   } catch (e) {
     console.error('[premium/notifications/settings] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to get notification settings' });
   }
-}); 
+});
 
 // Update a specific notification rule
 app.post('/premium/notifications/rule', auth, async (req, res) => {
@@ -841,7 +859,7 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
 });
 
 
-// Reset notification rules to defaults
+// Reset notification rules to defaults:
 app.post('/premium/notifications/reset', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -852,10 +870,14 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
       return res.status(403).json({ error: 'Premium subscription required' });
     }
 
+    console.log('[DEBUG] Resetting notification rules to updated Bedrock patterns...');
+
     // Delete existing settings and recreate with defaults
     await prisma.notificationSettings.deleteMany({
       where: { userId }
     });
+
+    const defaultRules = createDefaultNotificationRules();
 
     // Create default settings
     await prisma.notificationSettings.create({
@@ -863,50 +885,7 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
         userId,
         soundEnabled: false,
         rules: {
-          create: [
-            {
-              name: 'Player Join',
-              type: 'contains',
-              pattern: 'joined the game',
-              soundFile: 'player_join.wav',
-              enabled: true
-            },
-            {
-              name: 'Player Leave', 
-              type: 'contains',
-              pattern: 'left the game',
-              soundFile: 'player_leave.wav',
-              enabled: true
-            },
-            {
-              name: 'Error Alert',
-              type: 'regex',
-              pattern: '\\b(ERROR|FATAL)\\b',
-              soundFile: 'error_alert.wav',
-              enabled: true
-            },
-            {
-              name: 'Warning Alert',
-              type: 'contains',
-              pattern: 'WARN',
-              soundFile: 'warning.wav',
-              enabled: true
-            },
-            {
-              name: 'Server Crash',
-              type: 'contains',
-              pattern: 'FAIL',
-              soundFile: 'critical_alert.wav',
-              enabled: true
-            },
-            {
-              name: 'Server Stop',
-              type: 'contains',
-              pattern: 'Stopping server',
-              soundFile: 'server_stop.wav',
-              enabled: true
-            }
-          ]
+          create: defaultRules
         }
       }
     });
