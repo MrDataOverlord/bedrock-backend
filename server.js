@@ -1005,6 +1005,55 @@ app.post('/premium/notifications/trigger', auth, async (req, res) => {
   }
 });
 
+// Sound Notification Debugging
+app.get('/premium/notifications/settings', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    console.log('[DEBUG] Getting notification settings for user:', userId);
+    
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    console.log('[DEBUG] User has premium:', hasPremium);
+    
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Get or create default notification settings
+    let settings = await prisma.notificationSettings.findUnique({
+      where: { userId },
+      include: { rules: true }
+    });
+
+    console.log('[DEBUG] Found existing settings:', !!settings);
+
+    if (!settings) {
+      console.log('[DEBUG] Creating default settings...');
+      // Create default settings...
+      // (rest of your existing code)
+    }
+
+    const response = {
+      soundEnabled: settings.soundEnabled,
+      rules: {
+        rules: settings.rules.map(rule => ({
+          name: rule.name,
+          type: rule.type,
+          pattern: rule.pattern,
+          soundFile: rule.soundFile,
+          enabled: rule.enabled
+        }))
+      }
+    };
+
+    console.log('[DEBUG] Sending response:', JSON.stringify(response, null, 2));
+    res.json(response);
+  } catch (e) {
+    console.error('[premium/notifications/settings] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to get notification settings' });
+  }
+});
+
 // ---------- start ----------
 app.listen(PORT, () => {
   log(`API up on :${PORT}`);
