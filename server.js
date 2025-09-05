@@ -863,37 +863,66 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
 app.post('/premium/notifications/reset', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    console.log('[DEBUG] Reset request for user:', userId);
 
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
+      console.log('[DEBUG] User does not have premium');
       return res.status(403).json({ error: 'Premium subscription required' });
     }
 
     console.log('[DEBUG] Resetting notification rules to updated Bedrock patterns...');
 
-    // Delete existing settings and recreate with defaults
-    await prisma.notificationSettings.deleteMany({
-      where: { userId }
-    });
+    // Use a transaction to ensure atomicity
+    await prisma.$transaction(async (tx) => {
+      // First, delete all notification rules for this user
+      const settings = await tx.notificationSettings.findUnique({
+        where: { userId },
+        include: { rules: true }
+      });
 
-    const defaultRules = createDefaultNotificationRules();
-
-    // Create default settings
-    await prisma.notificationSettings.create({
-      data: {
-        userId,
-        soundEnabled: false,
-        rules: {
-          create: defaultRules
-        }
+      if (settings) {
+        console.log('[DEBUG] Found existing settings, deleting rules...');
+        
+        // Delete rules first (due to foreign key constraint)
+        await tx.notificationRule.deleteMany({
+          where: { settingsId: settings.id }
+        });
+        
+        // Delete the settings
+        await tx.notificationSettings.delete({
+          where: { id: settings.id }
+        });
+        
+        console.log('[DEBUG] Deleted existing settings and rules');
       }
+
+      // Create new settings with updated rules
+      const defaultRules = createDefaultNotificationRules();
+      console.log('[DEBUG] Creating new settings with rules:', defaultRules.map(r => r.name));
+
+      const newSettings = await tx.notificationSettings.create({
+        data: {
+          userId,
+          soundEnabled: false,
+          rules: {
+            create: defaultRules
+          }
+        },
+        include: { rules: true }
+      });
+
+      console.log('[DEBUG] Created new settings with', newSettings.rules.length, 'rules');
     });
 
+    console.log('[DEBUG] Reset completed successfully');
     res.json({ ok: true });
+    
   } catch (e) {
     console.error('[premium/notifications/reset] error:', e?.message || e);
-    res.status(500).json({ error: 'Failed to reset notification rules' });
+    console.error('[premium/notifications/reset] stack:', e?.stack);
+    res.status(500).json({ error: 'Failed to reset notification rules', detail: e?.message });
   }
 });
 
