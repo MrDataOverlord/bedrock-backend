@@ -480,6 +480,175 @@ app.post('/auth/reset/complete', async (req, res) => {
   }
 });
 
+app.post('/premium/notifications/migrate-patterns', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    console.log('[DEBUG] Pattern migration request for user:', userId);
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Get existing notification settings
+    const settings = await prisma.notificationSettings.findUnique({
+      where: { userId },
+      include: { rules: true }
+    });
+
+    if (!settings) {
+      console.log('[DEBUG] No existing settings found, creating new ones...');
+      
+      const defaultRules = createDefaultNotificationRules();
+      await prisma.notificationSettings.create({
+        data: {
+          userId,
+          soundEnabled: false,
+          rules: {
+            create: defaultRules
+          }
+        }
+      });
+      
+      return res.json({ ok: true, message: 'Created new settings with correct patterns' });
+    }
+
+    console.log('[DEBUG] Found existing settings, updating rule patterns...');
+
+    // Update existing rules to correct patterns
+    const updates = [
+      {
+        oldPattern: 'joined the game',
+        newPattern: 'Player connected:',
+        name: 'Player Join'
+      },
+      {
+        oldPattern: 'left the game', 
+        newPattern: 'Player disconnected:',
+        name: 'Player Leave'
+      }
+    ];
+
+    let updatedCount = 0;
+
+    for (const update of updates) {
+      const rule = settings.rules.find(r => 
+        r.pattern === update.oldPattern || r.name === update.name
+      );
+      
+      if (rule) {
+        await prisma.notificationRule.update({
+          where: { id: rule.id },
+          data: { 
+            pattern: update.newPattern,
+            type: 'contains' // Ensure it's set to contains
+          }
+        });
+        
+        console.log(`[DEBUG] Updated rule "${rule.name}": "${update.oldPattern}" -> "${update.newPattern}"`);
+        updatedCount++;
+      }
+    }
+
+    // Add new Player Spawn rule if it doesn't exist
+    const spawnRule = settings.rules.find(r => r.name === 'Player Spawn');
+    if (!spawnRule) {
+      await prisma.notificationRule.create({
+        data: {
+          settingsId: settings.id,
+          name: 'Player Spawn',
+          type: 'contains',
+          pattern: 'Player Spawned:',
+          soundFile: 'player_join.wav',
+          enabled: true
+        }
+      });
+      
+      console.log('[DEBUG] Added new Player Spawn rule');
+      updatedCount++;
+    }
+
+    console.log(`[DEBUG] Migration completed, updated ${updatedCount} rules`);
+    res.json({ ok: true, updated: updatedCount, message: 'Patterns updated successfully' });
+    
+  } catch (e) {
+    console.error('[premium/notifications/migrate-patterns] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to migrate patterns', detail: e?.message });
+  }
+});
+
+app.post('/premium/notifications/fix-patterns', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    console.log('[PATTERN_FIX] Fixing patterns for user:', userId);
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Update patterns directly in the database
+    const results = await prisma.$transaction(async (tx) => {
+      // Fix Player Join pattern
+      const joinUpdate = await tx.notificationRule.updateMany({
+        where: {
+          pattern: 'joined the game'
+        },
+        data: {
+          pattern: 'Player connected:'
+        }
+      });
+
+      // Fix Player Leave pattern
+      const leaveUpdate = await tx.notificationRule.updateMany({
+        where: {
+          pattern: 'left the game'
+        },
+        data: {
+          pattern: 'Player disconnected:'
+        }
+      });
+
+      return { joinUpdated: joinUpdate.count, leaveUpdated: leaveUpdate.count };
+    });
+
+    console.log('[PATTERN_FIX] Updated patterns:', results);
+    res.json({ 
+      ok: true, 
+      message: 'Patterns fixed successfully',
+      updated: results 
+    });
+
+  } catch (e) {
+    console.error('[PATTERN_FIX] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to fix patterns', detail: e?.message });
+  }
+});
+
+// Test endpoint to verify current patterns
+app.get('/premium/notifications/debug-patterns', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    const settings = await prisma.notificationSettings.findUnique({
+      where: { userId },
+      include: { rules: true }
+    });
+
+    const patterns = settings?.rules.map(rule => ({
+      name: rule.name,
+      pattern: rule.pattern,
+      type: rule.type
+    })) || [];
+
+    res.json({ patterns });
+  } catch (e) {
+    res.status(500).json({ error: e?.message });
+  }
+});
+
 // ----- Entitlements (with broadened self-heal) -----
 async function getEntitlementsPayload(userId) {
   const user = await prisma.user.findUnique({ where: { id: userId } });
