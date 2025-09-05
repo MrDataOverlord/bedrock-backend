@@ -1076,9 +1076,19 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
     const userId = req.user.sub;
     const { name, type, pattern, soundFile, enabled } = req.body || {};
 
+    console.log('[RULE_UPDATE] Update request for user:', userId);
+    console.log('[RULE_UPDATE] Request body:', { name, type, pattern, soundFile, enabled });
+
+    // Validate required fields
+    if (!name) {
+      console.log('[RULE_UPDATE] Missing rule name');
+      return res.status(400).json({ error: 'Rule name is required' });
+    }
+
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
+      console.log('[RULE_UPDATE] User does not have premium');
       return res.status(403).json({ error: 'Premium subscription required' });
     }
 
@@ -1089,32 +1099,69 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
     });
 
     if (!settings) {
+      console.log('[RULE_UPDATE] No notification settings found for user');
       return res.status(404).json({ error: 'Notification settings not found' });
     }
 
-    // Find and update the rule
+    // Find the rule to update
     const rule = settings.rules.find(r => r.name === name);
     if (!rule) {
+      console.log('[RULE_UPDATE] Rule not found:', name);
+      console.log('[RULE_UPDATE] Available rules:', settings.rules.map(r => r.name));
       return res.status(404).json({ error: 'Notification rule not found' });
     }
 
-    await prisma.notificationRule.update({
+    console.log('[RULE_UPDATE] Found rule to update:', { 
+      id: rule.id, 
+      name: rule.name,
+      currentSoundFile: rule.soundFile, 
+      newSoundFile: soundFile 
+    });
+
+    // Build update data object
+    const updateData = {};
+    if (type !== undefined && type !== null) updateData.type = type;
+    if (pattern !== undefined && pattern !== null) updateData.pattern = pattern;
+    if (soundFile !== undefined && soundFile !== null) updateData.soundFile = soundFile;
+    if (enabled !== undefined && enabled !== null) updateData.enabled = enabled;
+
+    console.log('[RULE_UPDATE] Updating rule with data:', updateData);
+
+    // Perform the update
+    const updatedRule = await prisma.notificationRule.update({
       where: { id: rule.id },
-      data: {
-        type: type || rule.type,
-        pattern: pattern || rule.pattern,
-        soundFile: soundFile || rule.soundFile,
-        enabled: enabled !== undefined ? enabled : rule.enabled
+      data: updateData
+    });
+
+    console.log('[RULE_UPDATE] Rule updated successfully:', {
+      id: updatedRule.id,
+      name: updatedRule.name,
+      soundFile: updatedRule.soundFile,
+      pattern: updatedRule.pattern,
+      enabled: updatedRule.enabled
+    });
+
+    res.json({ 
+      ok: true, 
+      rule: {
+        name: updatedRule.name,
+        type: updatedRule.type,
+        pattern: updatedRule.pattern,
+        soundFile: updatedRule.soundFile,
+        enabled: updatedRule.enabled
       }
     });
 
-    res.json({ ok: true });
   } catch (e) {
-    console.error('[premium/notifications/rule] error:', e?.message || e);
-    res.status(500).json({ error: 'Failed to update notification rule' });
+    console.error('[RULE_UPDATE] error:', e?.message || e);
+    console.error('[RULE_UPDATE] stack:', e?.stack);
+    res.status(500).json({ 
+      error: 'Failed to update notification rule', 
+      detail: e?.message,
+      code: e?.code 
+    });
   }
 });
-
 
 // Reset notification rules to defaults:
 app.post('/premium/notifications/reset', auth, async (req, res) => {
