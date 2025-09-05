@@ -700,6 +700,7 @@ app.post('/webhooks/stripe', async (req, res) => {
 // ---------- Premium Features (Server-Side Validation) ----------
 
 // Get user's notification settings
+// Get user's notification settings
 app.get('/premium/notifications/settings', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -787,11 +788,12 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
 
     console.log('[DEBUG] Sending response:', JSON.stringify(response, null, 2));
     res.json(response);
+
   } catch (e) {
     console.error('[premium/notifications/settings] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to get notification settings' });
   }
-});
+}); 
 
 // Update a specific notification rule
 app.post('/premium/notifications/rule', auth, async (req, res) => {
@@ -837,6 +839,7 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
     res.status(500).json({ error: 'Failed to update notification rule' });
   }
 });
+
 
 // Reset notification rules to defaults
 app.post('/premium/notifications/reset', auth, async (req, res) => {
@@ -946,25 +949,58 @@ app.get('/premium/sounds/:filename', auth, async (req, res) => {
     const userId = req.user.sub;
     const { filename } = req.params;
 
+    console.log(`[premium/sounds] Request for sound: ${filename} by user: ${userId}`);
+
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
+      console.log(`[premium/sounds] User ${userId} does not have premium`);
       return res.status(403).json({ error: 'Premium subscription required' });
     }
 
     // Validate filename for security
     if (!/^[a-zA-Z0-9_-]+\.(wav|mp3)$/.test(filename)) {
+      console.log(`[premium/sounds] Invalid filename: ${filename}`);
       return res.status(400).json({ error: 'Invalid filename' });
     }
 
-    // Serve from sounds directory
-    const soundPath = path.join(process.cwd(), 'sounds', filename);
+    // Ensure sounds directory exists
+    const soundsDir = path.join(process.cwd(), 'sounds');
+    if (!fs.existsSync(soundsDir)) {
+      console.log(`[premium/sounds] Creating sounds directory: ${soundsDir}`);
+      fs.mkdirSync(soundsDir, { recursive: true });
+    }
+
+    const soundPath = path.join(soundsDir, filename);
     
-    // Check if file exists
+    // Check if file exists, if not create a minimal default
     if (!fs.existsSync(soundPath)) {
-      // If sound file doesn't exist, create a minimal default sound
-      console.log(`[premium/sounds] Sound file not found: ${filename}, creating default`);
-      return res.status(404).json({ error: 'Sound file not found' });
+      console.log(`[premium/sounds] Sound file not found: ${filename}, creating minimal default`);
+      
+      // Create a minimal WAV file (silent audio)
+      const wavHeader = Buffer.from([
+        0x52, 0x49, 0x46, 0x46, // "RIFF"
+        0x24, 0x00, 0x00, 0x00, // File size - 8
+        0x57, 0x41, 0x56, 0x45, // "WAVE"
+        0x66, 0x6D, 0x74, 0x20, // "fmt "
+        0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
+        0x01, 0x00,             // AudioFormat (1 for PCM)
+        0x01, 0x00,             // NumChannels (1 = mono)
+        0x44, 0xAC, 0x00, 0x00, // SampleRate (44100)
+        0x44, 0xAC, 0x00, 0x00, // ByteRate
+        0x01, 0x00,             // BlockAlign
+        0x08, 0x00,             // BitsPerSample (8)
+        0x64, 0x61, 0x74, 0x61, // "data"
+        0x00, 0x00, 0x00, 0x00  // Subchunk2Size (0 = no audio data)
+      ]);
+
+      try {
+        fs.writeFileSync(soundPath, wavHeader);
+        console.log(`[premium/sounds] Created default sound file: ${soundPath}`);
+      } catch (writeError) {
+        console.error(`[premium/sounds] Failed to create default sound: ${writeError.message}`);
+        return res.status(500).json({ error: 'Could not create default sound file' });
+      }
     }
 
     // Set proper headers for audio files
@@ -973,14 +1009,26 @@ app.get('/premium/sounds/:filename', auth, async (req, res) => {
     
     res.setHeader('Content-Type', mimeType);
     res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    res.setHeader('Access-Control-Allow-Origin', '*'); // Allow CORS for audio files
+    
+    console.log(`[premium/sounds] Serving sound file: ${soundPath}`);
     
     // Stream the file
     const stream = fs.createReadStream(soundPath);
+    stream.on('error', (streamError) => {
+      console.error(`[premium/sounds] Stream error: ${streamError.message}`);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Failed to stream sound file' });
+      }
+    });
+    
     stream.pipe(res);
     
   } catch (e) {
     console.error('[premium/sounds] error:', e?.message || e);
-    res.status(500).json({ error: 'Failed to serve sound file' });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to serve sound file' });
+    }
   }
 });
 
