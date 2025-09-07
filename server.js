@@ -503,26 +503,6 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, env: NODE_ENV, ts: new Date().toISOString() });
 });
 
-// endpoint for testing emails
-app.post('/test-email', async (req, res) => {
-  try {
-    if (!transporter) {
-      return res.json({ error: 'SMTP not configured' });
-    }
-    
-    const info = await transporter.sendMail({
-      from: SMTP_USER,
-      to: 'tomyn@email.com', // or whatever test email
-      subject: 'Test Email',
-      html: '<p>This is a test email</p>'
-    });
-    
-    res.json({ success: true, messageId: info.messageId });
-  } catch (error) {
-    res.json({ error: error.message });
-  }
-});
-
 app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
