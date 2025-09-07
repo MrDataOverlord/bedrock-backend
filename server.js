@@ -12,6 +12,7 @@ import path from 'path';
 import { PrismaClient } from '@prisma/client';
 import { promises as fsPromises } from 'fs';
 import fs from 'fs';
+import multer from 'multer';
 
 // ---------- env ----------
 const {
@@ -48,6 +49,36 @@ app.use(helmet({
 
 const prisma = new PrismaClient();
 const stripe = new Stripe(STRIPE_SECRET_KEY);
+
+// Create uploads directory for backups
+const uploadsDir = path.join(process.cwd(), 'uploads', 'backups');
+fs.mkdirSync(uploadsDir, { recursive: true });
+console.log('[BACKUP] Uploads directory ready:', uploadsDir);
+
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, uploadsDir);
+  },
+  filename: (req, file, cb) => {
+    const userId = req.user.sub;
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `backup_${userId}_${timestamp}.zip`;
+    cb(null, filename);
+  }
+});
+
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100MB limit
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'application/zip' || file.originalname.endsWith('.zip')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only ZIP files are allowed'));
+    }
+  }
+});
 
 // CORS
 const allowed = (CORS_ORIGINS || 'https://nerdherdmc.net,https://www.nerdherdmc.net')
@@ -147,11 +178,12 @@ function createDefaultNotificationRules() {
     }
   ];
 }
+
 // ---------- SMTP ----------
 let transporter = null;
 (async () => {
   if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
-    transporter = nodemailer.createTransport({
+    transporter = nodemailer.createTransporter({
       host: SMTP_HOST,
       port: Number(SMTP_PORT || 465),
       secure: String(SMTP_SECURE || 'true') === 'true',
@@ -300,199 +332,6 @@ async function upsertSubscription({ orgId, sub }) {
   });
 }
 
-// ---------- Backup Implementation Functions ----------
-
-async function createWorldBackup(serverFolder, worldName, userId, backupType = 'automatic') {
-  try {
-    console.log(`[BACKUP] Creating ${backupType} backup for world: ${worldName}`);
-    
-    const worldPath = path.join(serverFolder, worldName);
-    if (!fs.existsSync(worldPath)) {
-      console.log(`[BACKUP] World folder not found: ${worldPath}`);
-      return { success: false, error: 'World folder does not exist' };
-    }
-
-    // Create backup directory structure
-    const backupsPath = path.join(serverFolder, 'world_backups');
-    await fsPromises.mkdir(backupsPath, { recursive: true });
-
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupFolderName = `${worldName}_${timestamp}`;
-    const backupPath = path.join(backupsPath, backupFolderName);
-
-    console.log(`[BACKUP] Creating backup folder: ${backupPath}`);
-
-    // Create backup folder
-    await fsPromises.mkdir(backupPath, { recursive: true });
-
-    // Copy world files to backup
-    await copyDirectory(worldPath, path.join(backupPath, worldName));
-
-    // Get backup size
-    const backupSize = await getDirectorySize(backupPath);
-
-    // Record in database
-    await prisma.backupHistory.create({
-      data: {
-        userId,
-        worldName,
-        backupPath: backupFolderName, // Store relative path
-        backupSize: BigInt(backupSize),
-        backupType
-      }
-    });
-
-    console.log(`[BACKUP] Created backup: ${backupFolderName} (${backupSize} bytes)`);
-    return { success: true, backupPath: backupFolderName };
-
-  } catch (error) {
-    console.error('[BACKUP] createWorldBackup error:', error);
-    return { success: false, error: error.message };
-  }
-}
-
-async function restoreWorldFromBackup(serverFolder, currentWorldName, backupPath, userId) {
-  try {
-    console.log(`[BACKUP] Restoring world ${currentWorldName} from backup: ${backupPath}`);
-    
-    const currentWorldPath = path.join(serverFolder, currentWorldName);
-    const backupSourcePath = path.join(backupPath, currentWorldName);
-
-    if (!fs.existsSync(backupSourcePath)) {
-      console.log(`[BACKUP] Backup world folder not found: ${backupSourcePath}`);
-      return { success: false, error: 'Backup world folder not found' };
-    }
-
-    // Create corrupted backup of current world
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const corruptedBackupName = `corrupted_${currentWorldName}_${timestamp}`;
-    const corruptedPath = path.join(serverFolder, 'world_backups', corruptedBackupName);
-
-    if (fs.existsSync(currentWorldPath)) {
-      console.log(`[BACKUP] Backing up current world to: ${corruptedPath}`);
-      await fsPromises.mkdir(path.dirname(corruptedPath), { recursive: true });
-      await copyDirectory(currentWorldPath, corruptedPath);
-      
-      // Remove current world
-      await fsPromises.rm(currentWorldPath, { recursive: true, force: true });
-    }
-
-    // Restore from backup
-    console.log(`[BACKUP] Restoring from backup source: ${backupSourcePath}`);
-    await copyDirectory(backupSourcePath, currentWorldPath);
-
-    // Record corrupted backup in database
-    const corruptedSize = await getDirectorySize(corruptedPath);
-    await prisma.backupHistory.create({
-      data: {
-        userId,
-        worldName: currentWorldName,
-        backupPath: corruptedBackupName,
-        backupSize: BigInt(corruptedSize),
-        backupType: 'corrupted'
-      }
-    });
-
-    console.log(`[BACKUP] Restored world from backup, saved corrupted copy to: ${corruptedBackupName}`);
-    return { success: true, corruptedPath: corruptedBackupName };
-
-  } catch (error) {
-    console.error('[BACKUP] restoreWorldFromBackup error:', error);
-    return { success: false, error: error.message };
-  }
-}
-
-async function scanBackupDirectory(backupsPath) {
-  try {
-    console.log(`[BACKUP] Scanning backup directory: ${backupsPath}`);
-    
-    if (!fs.existsSync(backupsPath)) {
-      console.log(`[BACKUP] Backup directory does not exist: ${backupsPath}`);
-      return [];
-    }
-
-    const backups = [];
-    const entries = await fsPromises.readdir(backupsPath, { withFileTypes: true });
-
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        const backupPath = path.join(backupsPath, entry.name);
-        
-        // Parse backup folder name: worldName_timestamp
-        const match = entry.name.match(/^(.+)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)$/);
-        if (match) {
-          const [, worldName, timestampStr] = match;
-          const timestamp = new Date(timestampStr.replace(/-/g, ':').replace(/T(\d{2}):(\d{2}):(\d{2}):(\d{3})Z/, 'T$1:$2:$3.$4Z'));
-          
-          const stats = await fsPromises.stat(backupPath);
-          const size = await getDirectorySize(backupPath);
-
-          backups.push({
-            worldName,
-            date: timestamp.toISOString().split('T')[0],
-            time: timestamp.toTimeString().split(' ')[0],
-            displayTime: timestamp.toLocaleTimeString(),
-            path: entry.name,
-            size,
-            created: timestamp
-          });
-        }
-      }
-    }
-
-    console.log(`[BACKUP] Found ${backups.length} backups`);
-    return backups.sort((a, b) => b.created.getTime() - a.created.getTime());
-
-  } catch (error) {
-    console.error('[BACKUP] scanBackupDirectory error:', error);
-    return [];
-  }
-}
-
-// ---------- Utility Functions ----------
-
-async function copyDirectory(source, destination) {
-  console.log(`[BACKUP] Copying directory: ${source} -> ${destination}`);
-  
-  await fsPromises.mkdir(destination, { recursive: true });
-  
-  const entries = await fsPromises.readdir(source, { withFileTypes: true });
-  
-  for (const entry of entries) {
-    const sourcePath = path.join(source, entry.name);
-    const destPath = path.join(destination, entry.name);
-    
-    if (entry.isDirectory()) {
-      await copyDirectory(sourcePath, destPath);
-    } else {
-      await fsPromises.copyFile(sourcePath, destPath);
-    }
-  }
-}
-
-async function getDirectorySize(dirPath) {
-  let totalSize = 0;
-  
-  try {
-    const entries = await fsPromises.readdir(dirPath, { withFileTypes: true });
-    
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry.name);
-      
-      if (entry.isDirectory()) {
-        totalSize += await getDirectorySize(fullPath);
-      } else {
-        const stats = await fsPromises.stat(fullPath);
-        totalSize += stats.size;
-      }
-    }
-  } catch (error) {
-    console.error('[BACKUP] getDirectorySize error:', error);
-  }
-  
-  return totalSize;
-}
-
 const getStripeCustomer = async (customerId) => {
   try { return await stripe.customers.retrieve(customerId); }
   catch { return null; }
@@ -639,7 +478,7 @@ app.post('/auth/reset/start', async (req, res) => {
   }
 });
 
-// ----- Forgot password (complete) – FIXED token validation -----
+// ----- Forgot password (complete) â€" FIXED token validation -----
 app.post('/auth/reset/complete', async (req, res) => {
   try {
     const { token, newPassword } = req.body || {};
@@ -1023,7 +862,7 @@ app.get('/premium/sounds', auth, async (req, res) => {
 
 // ---------- Billing ----------
 
-// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY) – blocks if a user already exists
+// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY) â€" blocks if a user already exists
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
@@ -1202,7 +1041,108 @@ app.post('/webhooks/stripe', async (req, res) => {
   res.json({ received: true });
 });
 
-// ---------- World Backup Premium Features ----------
+// ---------- World Backup Premium Features (NEW SECURE UPLOAD SYSTEM) ----------
+
+// Upload backup endpoint
+app.post('/premium/backups/upload', auth, upload.single('backup'), async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { worldName } = req.body;
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      // Clean up uploaded file
+      if (req.file) fs.unlinkSync(req.file.path);
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'No backup file uploaded' });
+    }
+
+    if (!worldName) {
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: 'World name is required' });
+    }
+
+    console.log(`[BACKUP] Processing upload for user ${userId}, world: ${worldName}`);
+
+    // Record in database
+    const backupRecord = await prisma.backupHistory.create({
+      data: {
+        userId,
+        worldName,
+        backupPath: req.file.filename,
+        backupSize: BigInt(req.file.size),
+        backupType: 'manual'
+      }
+    });
+
+    console.log(`[BACKUP] Upload completed: ${req.file.filename} (${req.file.size} bytes)`);
+
+    res.json({ 
+      success: true, 
+      backupId: backupRecord.id,
+      backupPath: req.file.filename,
+      message: 'Backup uploaded successfully' 
+    });
+
+  } catch (e) {
+    console.error('[premium/backups/upload] error:', e?.message || e);
+    
+    // Clean up file on error
+    if (req.file && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+    
+    res.status(500).json({ error: 'Failed to process backup upload' });
+  }
+});
+
+// Download backup endpoint
+app.get('/premium/backups/download/:backupId', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { backupId } = req.params;
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Find backup record
+    const backup = await prisma.backupHistory.findFirst({
+      where: { id: backupId, userId }
+    });
+
+    if (!backup) {
+      return res.status(404).json({ error: 'Backup not found' });
+    }
+
+    const backupPath = path.join(uploadsDir, backup.backupPath);
+    
+    if (!fs.existsSync(backupPath)) {
+      return res.status(404).json({ error: 'Backup file not found' });
+    }
+
+    console.log(`[BACKUP] Downloading backup: ${backup.backupPath} for user ${userId}`);
+
+    // Set headers for file download
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${backup.worldName}_backup.zip"`);
+    res.setHeader('Content-Length', fs.statSync(backupPath).size);
+
+    // Stream the file
+    const fileStream = fs.createReadStream(backupPath);
+    fileStream.pipe(res);
+
+  } catch (e) {
+    console.error('[premium/backups/download] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to download backup' });
+  }
+});
 
 // Get backup settings
 app.get('/premium/backups/settings', auth, async (req, res) => {
@@ -1325,115 +1265,38 @@ app.get('/premium/backups/history', auth, async (req, res) => {
   }
 });
 
-// List available backups for restore
+// List available backups for restore (updated for upload system)
 app.get('/premium/backups/available/:serverFolder', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
-    const serverFolder = decodeURIComponent(req.params.serverFolder);
     
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
       return res.status(403).json({ error: 'Premium subscription required' });
     }
 
-    if (!serverFolder || !fs.existsSync(serverFolder)) {
-      return res.status(400).json({ error: 'Invalid server folder path' });
-    }
+    // Get backups from database instead of scanning file system
+    const backups = await prisma.backupHistory.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 50
+    });
 
-    const backupsPath = path.join(serverFolder, 'world_backups');
-    if (!fs.existsSync(backupsPath)) {
-      return res.json({ backups: [] });
-    }
+    // Format for client compatibility
+    const formattedBackups = backups.map(backup => ({
+      worldName: backup.worldName,
+      date: backup.createdAt.toISOString().split('T')[0],
+      time: backup.createdAt.toTimeString().split(' ')[0],
+      displayTime: backup.createdAt.toLocaleTimeString(),
+      path: backup.id, // Use backup ID instead of file path
+      size: Number(backup.backupSize),
+      created: backup.createdAt
+    }));
 
-    const backups = await scanBackupDirectory(backupsPath);
-    res.json({ backups });
+    res.json({ backups: formattedBackups });
   } catch (e) {
     console.error('[premium/backups/available] error:', e?.message || e);
-    res.status(500).json({ error: 'Failed to scan backup directory' });
-  }
-});
-
-// Create manual backup
-app.post('/premium/backups/create', auth, async (req, res) => {
-  try {
-    const userId = req.user.sub;
-    const { serverFolder, worldName } = req.body || {};
-    
-    const hasPremium = await userHasActivePremium(userId);
-    if (!hasPremium) {
-      return res.status(403).json({ error: 'Premium subscription required' });
-    }
-
-    if (!serverFolder || !worldName) {
-      return res.status(400).json({ error: 'Server folder and world name are required' });
-    }
-
-    if (!fs.existsSync(serverFolder)) {
-      return res.status(400).json({ error: 'Server folder does not exist' });
-    }
-
-    const worldPath = path.join(serverFolder, worldName);
-    if (!fs.existsSync(worldPath)) {
-      return res.status(400).json({ error: 'World folder does not exist' });
-    }
-
-    // Create backup
-    const backupResult = await createWorldBackup(serverFolder, worldName, userId, 'manual');
-    
-    if (backupResult.success) {
-      res.json({ 
-        success: true, 
-        backupPath: backupResult.backupPath,
-        message: 'Backup created successfully' 
-      });
-    } else {
-      res.status(500).json({ error: backupResult.error || 'Backup creation failed' });
-    }
-  } catch (e) {
-    console.error('[premium/backups/create] error:', e?.message || e);
-    res.status(500).json({ error: 'Failed to create backup' });
-  }
-});
-
-// Restore from backup
-app.post('/premium/backups/restore', auth, async (req, res) => {
-  try {
-    const userId = req.user.sub;
-    const { serverFolder, currentWorldName, backupPath } = req.body || {};
-    
-    const hasPremium = await userHasActivePremium(userId);
-    if (!hasPremium) {
-      return res.status(403).json({ error: 'Premium subscription required' });
-    }
-
-    if (!serverFolder || !currentWorldName || !backupPath) {
-      return res.status(400).json({ error: 'All parameters are required' });
-    }
-
-    const fullBackupPath = path.join(serverFolder, 'world_backups', backupPath);
-    if (!fs.existsSync(fullBackupPath)) {
-      return res.status(400).json({ error: 'Backup does not exist' });
-    }
-
-    const restoreResult = await restoreWorldFromBackup(
-      serverFolder, 
-      currentWorldName, 
-      fullBackupPath, 
-      userId
-    );
-    
-    if (restoreResult.success) {
-      res.json({ 
-        success: true, 
-        corruptedPath: restoreResult.corruptedPath,
-        message: 'World restored successfully' 
-      });
-    } else {
-      res.status(500).json({ error: restoreResult.error || 'Restore failed' });
-    }
-  } catch (e) {
-    console.error('[premium/backups/restore] error:', e?.message || e);
-    res.status(500).json({ error: 'Failed to restore backup' });
+    res.status(500).json({ error: 'Failed to get available backups' });
   }
 });
 
@@ -1456,9 +1319,10 @@ app.delete('/premium/backups/:backupId', auth, async (req, res) => {
       return res.status(404).json({ error: 'Backup not found' });
     }
 
-    // Delete physical backup folder
-    if (fs.existsSync(backup.backupPath)) {
-      await fs.promises.rm(backup.backupPath, { recursive: true, force: true });
+    // Delete physical backup file
+    const backupPath = path.join(uploadsDir, backup.backupPath);
+    if (fs.existsSync(backupPath)) {
+      fs.unlinkSync(backupPath);
     }
 
     // Delete database record
