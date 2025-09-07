@@ -19,7 +19,6 @@ model Device {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
-
 model User {
   id            String   @id @default(cuid())
   email         String   @unique
@@ -34,6 +33,10 @@ model User {
   // Premium notification relations
   notificationSettings NotificationSettings?
   notificationTriggers NotificationTrigger[]
+  
+  // Premium backup relations
+  backupSettings BackupSettings?
+  backupHistory  BackupHistory[]
 }
 
 model Org {
@@ -104,6 +107,43 @@ model Subscription {
 
   @@index([orgId])
   @@index([provider])
+}
+
+// =======================
+// World Backup Premium Features
+// =======================
+
+model BackupSettings {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  enabled           Boolean  @default(true)
+  intervalHours     Int      @default(24)
+  backupTime        String   @default("00:00") // HH:MM format
+  maxBackups        Int      @default(7)
+  unlimitedBackups  Boolean  @default(false)
+  serverFolder      String?
+  worldName         String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model BackupHistory {
+  id           String   @id @default(cuid())
+  userId       String
+  worldName    String
+  backupPath   String
+  backupSize   BigInt   @default(0)
+  createdAt    DateTime @default(now())
+  backupType   String   @default("automatic") // "automatic" or "manual"
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([createdAt])
 }
 
 // =======================
