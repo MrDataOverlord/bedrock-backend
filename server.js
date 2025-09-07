@@ -152,7 +152,7 @@ function createDefaultNotificationRules() {
 let transporter = null;
 (async () => {
   if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
-    transporter = nodemailer.createTransporter({
+    transporter = nodemailer.createTransport({
       host: SMTP_HOST,
       port: Number(SMTP_PORT || 465),
       secure: String(SMTP_SECURE || 'true') === 'true',
