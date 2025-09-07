@@ -10,6 +10,7 @@ import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import path from 'path';
 import { PrismaClient } from '@prisma/client';
+import { promises as fsPromises } from 'fs';
 import fs from 'fs';
 
 // ---------- env ----------
@@ -297,6 +298,199 @@ async function upsertSubscription({ orgId, sub }) {
     },
     update: { status: sub.status, currentPeriodEnd: end }
   });
+}
+
+// ---------- Backup Implementation Functions ----------
+
+async function createWorldBackup(serverFolder, worldName, userId, backupType = 'automatic') {
+  try {
+    console.log(`[BACKUP] Creating ${backupType} backup for world: ${worldName}`);
+    
+    const worldPath = path.join(serverFolder, worldName);
+    if (!fs.existsSync(worldPath)) {
+      console.log(`[BACKUP] World folder not found: ${worldPath}`);
+      return { success: false, error: 'World folder does not exist' };
+    }
+
+    // Create backup directory structure
+    const backupsPath = path.join(serverFolder, 'world_backups');
+    await fsPromises.mkdir(backupsPath, { recursive: true });
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFolderName = `${worldName}_${timestamp}`;
+    const backupPath = path.join(backupsPath, backupFolderName);
+
+    console.log(`[BACKUP] Creating backup folder: ${backupPath}`);
+
+    // Create backup folder
+    await fsPromises.mkdir(backupPath, { recursive: true });
+
+    // Copy world files to backup
+    await copyDirectory(worldPath, path.join(backupPath, worldName));
+
+    // Get backup size
+    const backupSize = await getDirectorySize(backupPath);
+
+    // Record in database
+    await prisma.backupHistory.create({
+      data: {
+        userId,
+        worldName,
+        backupPath: backupFolderName, // Store relative path
+        backupSize: BigInt(backupSize),
+        backupType
+      }
+    });
+
+    console.log(`[BACKUP] Created backup: ${backupFolderName} (${backupSize} bytes)`);
+    return { success: true, backupPath: backupFolderName };
+
+  } catch (error) {
+    console.error('[BACKUP] createWorldBackup error:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+async function restoreWorldFromBackup(serverFolder, currentWorldName, backupPath, userId) {
+  try {
+    console.log(`[BACKUP] Restoring world ${currentWorldName} from backup: ${backupPath}`);
+    
+    const currentWorldPath = path.join(serverFolder, currentWorldName);
+    const backupSourcePath = path.join(backupPath, currentWorldName);
+
+    if (!fs.existsSync(backupSourcePath)) {
+      console.log(`[BACKUP] Backup world folder not found: ${backupSourcePath}`);
+      return { success: false, error: 'Backup world folder not found' };
+    }
+
+    // Create corrupted backup of current world
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const corruptedBackupName = `corrupted_${currentWorldName}_${timestamp}`;
+    const corruptedPath = path.join(serverFolder, 'world_backups', corruptedBackupName);
+
+    if (fs.existsSync(currentWorldPath)) {
+      console.log(`[BACKUP] Backing up current world to: ${corruptedPath}`);
+      await fsPromises.mkdir(path.dirname(corruptedPath), { recursive: true });
+      await copyDirectory(currentWorldPath, corruptedPath);
+      
+      // Remove current world
+      await fsPromises.rm(currentWorldPath, { recursive: true, force: true });
+    }
+
+    // Restore from backup
+    console.log(`[BACKUP] Restoring from backup source: ${backupSourcePath}`);
+    await copyDirectory(backupSourcePath, currentWorldPath);
+
+    // Record corrupted backup in database
+    const corruptedSize = await getDirectorySize(corruptedPath);
+    await prisma.backupHistory.create({
+      data: {
+        userId,
+        worldName: currentWorldName,
+        backupPath: corruptedBackupName,
+        backupSize: BigInt(corruptedSize),
+        backupType: 'corrupted'
+      }
+    });
+
+    console.log(`[BACKUP] Restored world from backup, saved corrupted copy to: ${corruptedBackupName}`);
+    return { success: true, corruptedPath: corruptedBackupName };
+
+  } catch (error) {
+    console.error('[BACKUP] restoreWorldFromBackup error:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+async function scanBackupDirectory(backupsPath) {
+  try {
+    console.log(`[BACKUP] Scanning backup directory: ${backupsPath}`);
+    
+    if (!fs.existsSync(backupsPath)) {
+      console.log(`[BACKUP] Backup directory does not exist: ${backupsPath}`);
+      return [];
+    }
+
+    const backups = [];
+    const entries = await fsPromises.readdir(backupsPath, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const backupPath = path.join(backupsPath, entry.name);
+        
+        // Parse backup folder name: worldName_timestamp
+        const match = entry.name.match(/^(.+)_(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z)$/);
+        if (match) {
+          const [, worldName, timestampStr] = match;
+          const timestamp = new Date(timestampStr.replace(/-/g, ':').replace(/T(\d{2}):(\d{2}):(\d{2}):(\d{3})Z/, 'T$1:$2:$3.$4Z'));
+          
+          const stats = await fsPromises.stat(backupPath);
+          const size = await getDirectorySize(backupPath);
+
+          backups.push({
+            worldName,
+            date: timestamp.toISOString().split('T')[0],
+            time: timestamp.toTimeString().split(' ')[0],
+            displayTime: timestamp.toLocaleTimeString(),
+            path: entry.name,
+            size,
+            created: timestamp
+          });
+        }
+      }
+    }
+
+    console.log(`[BACKUP] Found ${backups.length} backups`);
+    return backups.sort((a, b) => b.created.getTime() - a.created.getTime());
+
+  } catch (error) {
+    console.error('[BACKUP] scanBackupDirectory error:', error);
+    return [];
+  }
+}
+
+// ---------- Utility Functions ----------
+
+async function copyDirectory(source, destination) {
+  console.log(`[BACKUP] Copying directory: ${source} -> ${destination}`);
+  
+  await fsPromises.mkdir(destination, { recursive: true });
+  
+  const entries = await fsPromises.readdir(source, { withFileTypes: true });
+  
+  for (const entry of entries) {
+    const sourcePath = path.join(source, entry.name);
+    const destPath = path.join(destination, entry.name);
+    
+    if (entry.isDirectory()) {
+      await copyDirectory(sourcePath, destPath);
+    } else {
+      await fsPromises.copyFile(sourcePath, destPath);
+    }
+  }
+}
+
+async function getDirectorySize(dirPath) {
+  let totalSize = 0;
+  
+  try {
+    const entries = await fsPromises.readdir(dirPath, { withFileTypes: true });
+    
+    for (const entry of entries) {
+      const fullPath = path.join(dirPath, entry.name);
+      
+      if (entry.isDirectory()) {
+        totalSize += await getDirectorySize(fullPath);
+      } else {
+        const stats = await fsPromises.stat(fullPath);
+        totalSize += stats.size;
+      }
+    }
+  } catch (error) {
+    console.error('[BACKUP] getDirectorySize error:', error);
+  }
+  
+  return totalSize;
 }
 
 const getStripeCustomer = async (customerId) => {
