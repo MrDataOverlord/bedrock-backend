@@ -13,6 +13,8 @@ import { PrismaClient } from '@prisma/client';
 import { promises as fsPromises } from 'fs';
 import fs from 'fs';
 import multer from 'multer';
+import { createWriteStream } from 'fs';
+import archiver from 'archiver';
 
 // ---------- env ----------
 const {
@@ -478,7 +480,7 @@ app.post('/auth/reset/start', async (req, res) => {
   }
 });
 
-// ----- Forgot password (complete) â€" FIXED token validation -----
+// ----- Forgot password (complete) -----
 app.post('/auth/reset/complete', async (req, res) => {
   try {
     const { token, newPassword } = req.body || {};
@@ -862,7 +864,7 @@ app.get('/premium/sounds', auth, async (req, res) => {
 
 // ---------- Billing ----------
 
-// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY) â€" blocks if a user already exists
+// PUBLIC CHECKOUT (NEW-ACCOUNT ONLY) – blocks if a user already exists
 app.post('/billing/checkout_public', async (req, res) => {
   try {
     const { email, returnUrl } = req.body || {};
@@ -1041,7 +1043,88 @@ app.post('/webhooks/stripe', async (req, res) => {
   res.json({ received: true });
 });
 
-// ---------- World Backup Premium Features (NEW SECURE UPLOAD SYSTEM) ----------
+// ---------- World Backup Premium Features ----------
+
+// NEW: Create backup endpoint
+app.post('/premium/backups/create', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { serverFolder, worldName } = req.body || {};
+
+    console.log(`[BACKUP_CREATE] Request from user ${userId}: serverFolder=${serverFolder}, worldName=${worldName}`);
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    if (!serverFolder || !worldName) {
+      return res.status(400).json({ error: 'Server folder and world name are required' });
+    }
+
+    // Check if world folder exists
+    const worldPath = path.join(serverFolder, 'worlds', worldName);
+    console.log(`[BACKUP_CREATE] Checking world path: ${worldPath}`);
+    
+    if (!fs.existsSync(worldPath)) {
+      console.log(`[BACKUP_CREATE] World folder not found: ${worldPath}`);
+      return res.status(400).json({ error: 'World folder does not exist' });
+    }
+
+    // Create backup ZIP file
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFileName = `backup_${userId}_${worldName}_${timestamp}.zip`;
+    const backupPath = path.join(uploadsDir, backupFileName);
+
+    console.log(`[BACKUP_CREATE] Creating backup: ${backupPath}`);
+
+    // Create the ZIP archive
+    const output = createWriteStream(backupPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
+
+    archive.pipe(output);
+
+    // Add all files in the world directory to the archive
+    archive.directory(worldPath, worldName);
+
+    await archive.finalize();
+
+    // Wait for the output stream to close
+    await new Promise((resolve, reject) => {
+      output.on('close', resolve);
+      output.on('error', reject);
+    });
+
+    // Get file size
+    const stats = fs.statSync(backupPath);
+    const backupSize = stats.size;
+
+    console.log(`[BACKUP_CREATE] Backup created: ${backupFileName} (${backupSize} bytes)`);
+
+    // Record in database
+    const backupRecord = await prisma.backupHistory.create({
+      data: {
+        userId,
+        worldName,
+        backupPath: backupFileName,
+        backupSize: BigInt(backupSize),
+        backupType: 'manual'
+      }
+    });
+
+    res.json({
+      success: true,
+      backupPath: backupFileName,
+      backupId: backupRecord.id,
+      message: 'Backup created successfully'
+    });
+
+  } catch (e) {
+    console.error('[premium/backups/create] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to create backup', detail: e?.message });
+  }
+});
 
 // Upload backup endpoint
 app.post('/premium/backups/upload', auth, upload.single('backup'), async (req, res) => {
@@ -1193,6 +1276,10 @@ app.post('/premium/backups/settings', auth, async (req, res) => {
       worldName 
     } = req.body || {};
 
+    console.log(`[BACKUP_SETTINGS] Update request for user ${userId}:`, {
+      enabled, intervalHours, backupTime, maxBackups, unlimitedBackups, serverFolder, worldName
+    });
+
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
       return res.status(403).json({ error: 'Premium subscription required' });
@@ -1220,6 +1307,8 @@ app.post('/premium/backups/settings', auth, async (req, res) => {
     if (serverFolder !== undefined) updateData.serverFolder = serverFolder;
     if (worldName !== undefined) updateData.worldName = worldName;
 
+    console.log(`[BACKUP_SETTINGS] Updating with data:`, updateData);
+
     const settings = await prisma.backupSettings.upsert({
       where: { userId },
       create: {
@@ -1235,6 +1324,7 @@ app.post('/premium/backups/settings', auth, async (req, res) => {
       update: updateData
     });
 
+    console.log(`[BACKUP_SETTINGS] Settings saved successfully for user ${userId}`);
     res.json(settings);
   } catch (e) {
     console.error('[premium/backups/settings] error:', e?.message || e);
