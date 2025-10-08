@@ -25,6 +25,7 @@ model User {
   email         String   @unique
   passwordHash  String?
   totpSecret    String?
+  isAdmin       Boolean  @default(false) 
   createdAt     DateTime @default(now())
 
   ownedOrgs      Org[]
