@@ -93,33 +93,6 @@ function auth(req, res, next) {
   }
 }
 
-// Admin authorization middleware
-function adminAuth(req, res, next) {
-  try {
-    const h = req.headers.authorization || '';
-    const [, token] = h.split(' ');
-    if (!token) return res.status(401).json({ error: 'Missing bearer token' });
-    
-    req.user = jwt.verify(token, JWT_SECRET);
-    
-    // Check if user is admin
-    prisma.user.findUnique({ 
-      where: { id: req.user.sub },
-      select: { isAdmin: true }
-    }).then(user => {
-      if (!user?.isAdmin) {
-        return res.status(403).json({ error: 'Admin access required' });
-      }
-      next();
-    }).catch(err => {
-      res.status(401).json({ error: 'Invalid token' });
-    });
-    
-  } catch {
-    res.status(401).json({ error: 'Invalid token' });
-  }
-}
-
 // Function to create default notification rules that match actual Bedrock server format
 function createDefaultNotificationRules() {
   return [
