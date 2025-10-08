@@ -867,32 +867,47 @@ app.post('/billing/checkout_public', async (req, res) => {
 });
 
 // AUTH'D RENEW CHECKOUT (ONLY WHEN NO ACTIVE PREMIUM)
+// AUTH'D RENEW CHECKOUT - FIXED for Stripe subscription mode
 app.post('/billing/checkout_renew', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user?.email) return res.status(400).json({ error: 'missing_email' });
 
+    console.log('[checkout_renew] Processing renewal for:', user.email);
+
     // Get verified customer id if exists
     const verifiedCustomerId = await getValidCustomerIdForUser(userId, user.email);
 
-    const session = await stripe.checkout.sessions.create({
+    // Create checkout session
+    const sessionConfig = {
       mode: 'subscription',
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      ...(verifiedCustomerId
-        ? { customer: verifiedCustomerId }
-        : { customer_creation: 'always', customer_email: user.email }),
       success_url: 'https://www.nerdherdmc.net/accounts?renew=success&session_id={CHECKOUT_SESSION_ID}',
       cancel_url: 'https://www.nerdherdmc.net/accounts?renew=cancel',
       allow_promotion_codes: true,
-    });
+    };
 
-    console.log('[checkout_renew] Created checkout session for', user.email);
+    // Add customer info - use existing customer OR just customer_email (NOT customer_creation)
+    if (verifiedCustomerId) {
+      sessionConfig.customer = verifiedCustomerId;
+      console.log('[checkout_renew] Using existing customer:', verifiedCustomerId);
+    } else {
+      sessionConfig.customer_email = user.email;
+      console.log('[checkout_renew] Creating new customer for:', user.email);
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionConfig);
+
+    console.log('[checkout_renew] Checkout session created:', session.id);
     return res.json({ url: session.url });
     
   } catch (e) {
     console.error('[checkout_renew] error:', e?.message || e);
-    return res.status(500).json({ error: 'Checkout failed', detail: e?.message });
+    return res.status(500).json({ 
+      error: 'Checkout failed', 
+      detail: e?.message 
+    });
   }
 });
 
