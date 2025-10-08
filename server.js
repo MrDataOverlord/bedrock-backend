@@ -911,7 +911,7 @@ app.get('/billing/price_check', async (_req, res) => {
   }
 });
 
-// Cancel subscription (keeps access until period end)
+// Cancel subscription (keeps access until period end) - FIXED VERSION
 app.post('/billing/cancel_subscription', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -950,32 +950,60 @@ app.post('/billing/cancel_subscription', auth, async (req, res) => {
     }
 
     const subscription = orgWithSub.subscriptions[0];
-    const stripeSubId = subscription.id.replace('stripe_', ''); // Remove our prefix
+    const stripeSubId = subscription.id.replace('stripe_', '');
 
-    console.log('[cancel_subscription] Canceling Stripe subscription:', stripeSubId);
+    console.log('[cancel_subscription] Attempting to cancel Stripe subscription:', stripeSubId);
 
-    // Cancel in Stripe at period end (user keeps access until then)
-    const updatedSub = await stripe.subscriptions.update(stripeSubId, {
-      cancel_at_period_end: true
-    });
+    try {
+      // Try to cancel in Stripe at period end
+      const updatedSub = await stripe.subscriptions.update(stripeSubId, {
+        cancel_at_period_end: true
+      });
 
-    // Update our database
-    await prisma.subscription.update({
-      where: { id: subscription.id },
-      data: { 
-        status: updatedSub.status,
-        updatedAt: new Date()
+      // Update our database with Stripe's response
+      await prisma.subscription.update({
+        where: { id: subscription.id },
+        data: { 
+          status: updatedSub.status,
+          updatedAt: new Date()
+        }
+      });
+
+      const periodEnd = subscription.currentPeriodEnd;
+      console.log('[cancel_subscription] Subscription canceled successfully, access until:', periodEnd);
+
+      return res.json({ 
+        ok: true, 
+        message: 'Subscription canceled',
+        accessUntil: periodEnd.toISOString()
+      });
+
+    } catch (stripeError) {
+      console.error('[cancel_subscription] Stripe error:', stripeError.message);
+
+      // Handle specific Stripe errors
+      if (stripeError.message?.includes('No such subscription')) {
+        // Subscription doesn't exist in Stripe, so mark it canceled in our DB
+        console.log('[cancel_subscription] Subscription not found in Stripe, marking as canceled in DB');
+        
+        await prisma.subscription.update({
+          where: { id: subscription.id },
+          data: { 
+            status: 'canceled',
+            updatedAt: new Date()
+          }
+        });
+
+        return res.json({
+          ok: true,
+          message: 'Subscription was already canceled or not found in payment system',
+          note: 'Your subscription has been marked as canceled'
+        });
       }
-    });
 
-    const periodEnd = subscription.currentPeriodEnd;
-    console.log('[cancel_subscription] Subscription canceled, access until:', periodEnd);
-
-    res.json({ 
-      ok: true, 
-      message: 'Subscription canceled',
-      accessUntil: periodEnd.toISOString()
-    });
+      // For other Stripe errors, throw to outer catch
+      throw stripeError;
+    }
 
   } catch (e) {
     console.error('[cancel_subscription] error:', e?.message || e);
