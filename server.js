@@ -238,9 +238,15 @@ app.use(express.json({
 }));
 
 // ---------- Org / Member / Subscription ----------
+// Updated to recognize canceled subscriptions that still have time left
 const isPremium = (status, end) => {
   const s = String(status || '').toLowerCase();
-  return (s === 'active' || s === 'trialing') && end instanceof Date && end.getTime() > Date.now();
+  const hasValidPeriod = end instanceof Date && end.getTime() > Date.now();
+  
+  // Premium if:
+  // - Status is active/trialing AND period hasn't ended
+  // - OR status is canceled BUT period hasn't ended yet (user keeps access until end)
+  return ((s === 'active' || s === 'trialing' || s === 'canceled') && hasValidPeriod);
 };
 
 async function userHasActivePremium(userId) {
