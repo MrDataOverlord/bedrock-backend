@@ -911,6 +911,272 @@ app.get('/billing/price_check', async (_req, res) => {
   }
 });
 
+// Cancel subscription (keeps access until period end)
+app.post('/billing/cancel_subscription', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    console.log('[cancel_subscription] Request from user:', userId);
+
+    // Verify user has an active premium subscription
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(400).json({ error: 'No active subscription to cancel' });
+    }
+
+    // Find user's orgs with active subscriptions
+    const orgs = await prisma.org.findMany({
+      where: { 
+        OR: [
+          { ownerUserId: userId }, 
+          { members: { some: { userId } } }
+        ]
+      },
+      include: {
+        subscriptions: {
+          where: {
+            status: { in: ['active', 'trialing'] },
+            currentPeriodEnd: { gt: new Date() }
+          },
+          orderBy: { updatedAt: 'desc' },
+          take: 1
+        }
+      }
+    });
+
+    // Find the first org with an active subscription
+    const orgWithSub = orgs.find(o => o.subscriptions.length > 0);
+    if (!orgWithSub || !orgWithSub.subscriptions[0]) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    const subscription = orgWithSub.subscriptions[0];
+    const stripeSubId = subscription.id.replace('stripe_', ''); // Remove our prefix
+
+    console.log('[cancel_subscription] Canceling Stripe subscription:', stripeSubId);
+
+    // Cancel in Stripe at period end (user keeps access until then)
+    const updatedSub = await stripe.subscriptions.update(stripeSubId, {
+      cancel_at_period_end: true
+    });
+
+    // Update our database
+    await prisma.subscription.update({
+      where: { id: subscription.id },
+      data: { 
+        status: updatedSub.status,
+        updatedAt: new Date()
+      }
+    });
+
+    const periodEnd = subscription.currentPeriodEnd;
+    console.log('[cancel_subscription] Subscription canceled, access until:', periodEnd);
+
+    res.json({ 
+      ok: true, 
+      message: 'Subscription canceled',
+      accessUntil: periodEnd.toISOString()
+    });
+
+  } catch (e) {
+    console.error('[cancel_subscription] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to cancel subscription', 
+      detail: e?.message 
+    });
+  }
+});
+
+
+// Delete user account (GDPR compliant)
+app.delete('/auth/delete_account', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { confirmEmail } = req.body || {};
+    
+    console.log('[delete_account] Request from user:', userId);
+
+    // Get user details
+    const user = await prisma.user.findUnique({ 
+      where: { id: userId },
+      include: {
+        ownedOrgs: {
+          include: { 
+            subscriptions: true,
+            members: true
+          }
+        },
+        memberships: true,
+        notificationSettings: {
+          include: { rules: true }
+        },
+        notificationTriggers: true
+      }
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Email confirmation check (optional but recommended)
+    if (confirmEmail && confirmEmail.toLowerCase().trim() !== user.email) {
+      return res.status(400).json({ error: 'Email confirmation does not match' });
+    }
+
+    console.log('[delete_account] User found:', user.email);
+
+    // Step 1: Cancel ALL active Stripe subscriptions first
+    const activeSubscriptions = [];
+    for (const org of user.ownedOrgs) {
+      for (const sub of org.subscriptions) {
+        if (sub.status === 'active' || sub.status === 'trialing') {
+          activeSubscriptions.push(sub);
+        }
+      }
+    }
+
+    console.log('[delete_account] Found', activeSubscriptions.length, 'active subscriptions to cancel');
+
+    for (const sub of activeSubscriptions) {
+      try {
+        const stripeSubId = sub.id.replace('stripe_', '');
+        console.log('[delete_account] Canceling subscription:', stripeSubId);
+        
+        // Cancel immediately (not at period end) since user is deleting account
+        await stripe.subscriptions.cancel(stripeSubId);
+        
+        // Update our database
+        await prisma.subscription.update({
+          where: { id: sub.id },
+          data: { status: 'canceled' }
+        });
+      } catch (stripeErr) {
+        console.error('[delete_account] Failed to cancel subscription:', stripeErr?.message);
+        // Continue with deletion even if Stripe fails
+      }
+    }
+
+    // Step 2: Delete user data in transaction
+    console.log('[delete_account] Deleting user data...');
+
+    await prisma.$transaction(async (tx) => {
+      // Delete notification triggers
+      await tx.notificationTrigger.deleteMany({
+        where: { userId }
+      });
+
+      // Delete notification rules and settings
+      if (user.notificationSettings) {
+        await tx.notificationRule.deleteMany({
+          where: { settingsId: user.notificationSettings.id }
+        });
+        await tx.notificationSettings.delete({
+          where: { id: user.notificationSettings.id }
+        });
+      }
+
+      // Delete password tokens
+      await tx.passwordToken.deleteMany({
+        where: { userId }
+      });
+
+      // Delete memberships
+      await tx.member.deleteMany({
+        where: { userId }
+      });
+
+      // Delete subscriptions from owned orgs
+      for (const org of user.ownedOrgs) {
+        await tx.subscription.deleteMany({
+          where: { orgId: org.id }
+        });
+      }
+
+      // Delete owned orgs
+      await tx.org.deleteMany({
+        where: { ownerUserId: userId }
+      });
+
+      // Finally, delete the user
+      await tx.user.delete({
+        where: { id: userId }
+      });
+    });
+
+    console.log('[delete_account] Account deleted successfully:', user.email);
+
+    // Log the deletion for compliance/audit trail
+    console.log('[AUDIT] Account deletion:', {
+      userId,
+      email: user.email,
+      timestamp: new Date().toISOString(),
+      subscriptionsCanceled: activeSubscriptions.length
+    });
+
+    res.json({ 
+      ok: true, 
+      message: 'Account deleted successfully' 
+    });
+
+  } catch (e) {
+    console.error('[delete_account] error:', e?.message || e);
+    console.error('[delete_account] stack:', e?.stack);
+    res.status(500).json({ 
+      error: 'Failed to delete account', 
+      detail: e?.message 
+    });
+  }
+});
+
+// Add this endpoint to check if subscription is set to cancel
+
+app.get('/billing/subscription_status', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    const orgs = await prisma.org.findMany({
+      where: { 
+        OR: [
+          { ownerUserId: userId }, 
+          { members: { some: { userId } } }
+        ]
+      },
+      include: {
+        subscriptions: {
+          where: {
+            status: { in: ['active', 'trialing'] },
+            currentPeriodEnd: { gt: new Date() }
+          },
+          orderBy: { updatedAt: 'desc' },
+          take: 1
+        }
+      }
+    });
+
+    const orgWithSub = orgs.find(o => o.subscriptions.length > 0);
+    if (!orgWithSub || !orgWithSub.subscriptions[0]) {
+      return res.json({ hasSubscription: false });
+    }
+
+    const subscription = orgWithSub.subscriptions[0];
+    const stripeSubId = subscription.id.replace('stripe_', '');
+    
+    // Get full subscription details from Stripe
+    const stripeSub = await stripe.subscriptions.retrieve(stripeSubId);
+    
+    res.json({
+      hasSubscription: true,
+      status: stripeSub.status,
+      cancelAtPeriodEnd: stripeSub.cancel_at_period_end,
+      currentPeriodEnd: stripeSub.current_period_end ? 
+        new Date(stripeSub.current_period_end * 1000).toISOString() : null
+    });
+
+  } catch (e) {
+    console.error('[subscription_status] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to get subscription status' });
+  }
+});
+
 // ---------- Stripe webhooks ----------
 app.post('/webhooks/stripe', async (req, res) => {
   let event;
