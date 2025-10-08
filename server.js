@@ -93,6 +93,33 @@ function auth(req, res, next) {
   }
 }
 
+// Admin authorization middleware
+function adminAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    const [, token] = h.split(' ');
+    if (!token) return res.status(401).json({ error: 'Missing bearer token' });
+    
+    req.user = jwt.verify(token, JWT_SECRET);
+    
+    // Check if user is admin
+    prisma.user.findUnique({ 
+      where: { id: req.user.sub },
+      select: { isAdmin: true }
+    }).then(user => {
+      if (!user?.isAdmin) {
+        return res.status(403).json({ error: 'Admin access required' });
+      }
+      next();
+    }).catch(err => {
+      res.status(401).json({ error: 'Invalid token' });
+    });
+    
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
 // Function to create default notification rules that match actual Bedrock server format
 function createDefaultNotificationRules() {
   return [
@@ -913,6 +940,263 @@ app.get('/billing/price_check', async (_req, res) => {
     res.status(500).json({ error: e?.message || 'price check failed' });
   }
 });
+
+// ========== ADMIN ENDPOINTS ==========
+
+// Admin authorization middleware
+function adminAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    const [, token] = h.split(' ');
+    if (!token) return res.status(401).json({ error: 'Missing bearer token' });
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    
+    // Check if user is admin
+    prisma.user.findUnique({ 
+      where: { id: decoded.sub },
+      select: { isAdmin: true }
+    }).then(user => {
+      if (!user?.isAdmin) {
+        return res.status(403).json({ error: 'Admin access required' });
+      }
+      next();
+    }).catch(err => {
+      res.status(401).json({ error: 'Invalid token' });
+    });
+    
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// Manually grant premium to any user (ADMIN ONLY)
+app.post('/admin/grant_premium', adminAuth, async (req, res) => {
+  try {
+    const { email, days = 30 } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    console.log('[admin/grant_premium] Granting premium to:', email, 'for', days, 'days');
+
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase().trim() } });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Find or create an org for this user
+    let org = await prisma.org.findFirst({
+      where: { ownerUserId: user.id }
+    });
+
+    if (!org) {
+      org = await prisma.org.create({
+        data: { 
+          name: `${email.split('@')[0]}'s Org`,
+          ownerUserId: user.id
+        }
+      });
+
+      await prisma.member.create({
+        data: { orgId: org.id, userId: user.id, role: 'owner' }
+      });
+    }
+
+    // Create a manual subscription (no Stripe)
+    const periodEnd = new Date();
+    periodEnd.setDate(periodEnd.getDate() + parseInt(days));
+
+    const manualSubId = `manual_${user.id}_${Date.now()}`;
+    
+    // Delete any existing manual subscriptions for this user
+    await prisma.subscription.deleteMany({
+      where: {
+        orgId: org.id,
+        provider: 'manual'
+      }
+    });
+
+    // Create new manual subscription
+    await prisma.subscription.create({
+      data: {
+        id: manualSubId,
+        orgId: org.id,
+        provider: 'manual',
+        status: 'active',
+        currentPeriodEnd: periodEnd,
+        customerId: 'manual'
+      }
+    });
+
+    console.log('[admin/grant_premium] Premium granted to', email, 'until:', periodEnd);
+
+    res.json({
+      ok: true,
+      message: `Premium access granted to ${email} for ${days} days`,
+      email: email,
+      expiresAt: periodEnd.toISOString()
+    });
+
+  } catch (e) {
+    console.error('[admin/grant_premium] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to grant premium', 
+      detail: e?.message 
+    });
+  }
+});
+
+// Manually create account and send registration email (ADMIN ONLY)
+app.post('/admin/create_account', adminAuth, async (req, res) => {
+  try {
+    const { email, grantPremiumDays } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    const cleanEmail = email.toLowerCase().trim();
+    console.log('[admin/create_account] Creating account for:', cleanEmail);
+
+    // Check if user already exists
+    let user = await prisma.user.findUnique({ where: { email: cleanEmail } });
+    
+    if (user) {
+      if (user.passwordHash) {
+        return res.status(400).json({ 
+          error: 'Account already exists with password set',
+          note: 'User can login directly'
+        });
+      }
+      console.log('[admin/create_account] User exists but no password, resending registration');
+    } else {
+      // Create new user
+      user = await prisma.user.create({ 
+        data: { email: cleanEmail }
+      });
+      console.log('[admin/create_account] Created new user:', user.id);
+    }
+
+    // Create and send registration token
+    const raw = await issueRegistrationToken(user.id);
+    await sendRegistrationEmail(cleanEmail, raw);
+    console.log('[admin/create_account] Registration email sent to:', cleanEmail);
+
+    // Optionally grant premium if days specified
+    let premiumInfo = null;
+    if (grantPremiumDays && grantPremiumDays > 0) {
+      let org = await prisma.org.findFirst({
+        where: { ownerUserId: user.id }
+      });
+
+      if (!org) {
+        org = await prisma.org.create({
+          data: { 
+            name: `${cleanEmail.split('@')[0]}'s Org`,
+            ownerUserId: user.id
+          }
+        });
+
+        await prisma.member.create({
+          data: { orgId: org.id, userId: user.id, role: 'owner' }
+        });
+      }
+
+      const periodEnd = new Date();
+      periodEnd.setDate(periodEnd.getDate() + parseInt(grantPremiumDays));
+
+      const manualSubId = `manual_${user.id}_${Date.now()}`;
+      
+      await prisma.subscription.deleteMany({
+        where: { orgId: org.id, provider: 'manual' }
+      });
+
+      await prisma.subscription.create({
+        data: {
+          id: manualSubId,
+          orgId: org.id,
+          provider: 'manual',
+          status: 'active',
+          currentPeriodEnd: periodEnd,
+          customerId: 'manual'
+        }
+      });
+
+      premiumInfo = {
+        granted: true,
+        days: grantPremiumDays,
+        expiresAt: periodEnd.toISOString()
+      };
+
+      console.log('[admin/create_account] Premium granted for', grantPremiumDays, 'days');
+    }
+
+    res.json({
+      ok: true,
+      message: `Account created and registration email sent to ${cleanEmail}`,
+      email: cleanEmail,
+      userId: user.id,
+      premium: premiumInfo,
+      alreadyExisted: !!user.passwordHash
+    });
+
+  } catch (e) {
+    console.error('[admin/create_account] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to create account', 
+      detail: e?.message 
+    });
+  }
+});
+
+// List all users (ADMIN ONLY)
+app.get('/admin/users', adminAuth, async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: {
+        id: true,
+        email: true,
+        isAdmin: true,
+        createdAt: true,
+        ownedOrgs: {
+          include: {
+            subscriptions: {
+              orderBy: { updatedAt: 'desc' },
+              take: 1
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const usersWithStatus = users.map(u => {
+      const org = u.ownedOrgs?.[0];
+      const sub = org?.subscriptions?.[0];
+      const premium = sub && isPremium(sub.status, sub.currentPeriodEnd);
+
+      return {
+        id: u.id,
+        email: u.email,
+        isAdmin: u.isAdmin,
+        createdAt: u.createdAt,
+        premium: premium,
+        subscriptionStatus: sub?.status || 'none',
+        subscriptionEnd: sub?.currentPeriodEnd || null
+      };
+    });
+
+    res.json({ users: usersWithStatus });
+  } catch (e) {
+    console.error('[admin/users] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to list users' });
+  }
+});
+
+// ========== END OF ADMIN ENDPOINTS ==========
 
 // Cancel subscription (keeps access until period end) - FIXED VERSION
 app.post('/billing/cancel_subscription', auth, async (req, res) => {
