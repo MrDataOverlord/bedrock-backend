@@ -1205,6 +1205,93 @@ app.get('/billing/subscription_status', auth, async (req, res) => {
   }
 });
 
+
+// Cleanup stale subscriptions (removes subscriptions that don't exist in Stripe)
+app.post('/billing/cleanup_subscriptions', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    console.log('[cleanup_subscriptions] Request from user:', userId);
+
+    // Find all orgs for this user
+    const orgs = await prisma.org.findMany({
+      where: { 
+        OR: [
+          { ownerUserId: userId }, 
+          { members: { some: { userId } } }
+        ]
+      },
+      include: {
+        subscriptions: {
+          where: {
+            status: { in: ['active', 'trialing'] }
+          }
+        }
+      }
+    });
+
+    let cleanedCount = 0;
+    let errors = [];
+
+    // Check each subscription in Stripe
+    for (const org of orgs) {
+      for (const sub of org.subscriptions) {
+        const stripeSubId = sub.id.replace('stripe_', '');
+        console.log('[cleanup] Checking subscription:', stripeSubId);
+
+        try {
+          // Try to retrieve from Stripe
+          const stripeSub = await stripe.subscriptions.retrieve(stripeSubId);
+          
+          // If subscription exists but is canceled, update our DB
+          if (stripeSub.status === 'canceled' || stripeSub.cancel_at_period_end) {
+            await prisma.subscription.update({
+              where: { id: sub.id },
+              data: { 
+                status: 'canceled',
+                updatedAt: new Date()
+              }
+            });
+            cleanedCount++;
+            console.log('[cleanup] Marked as canceled:', stripeSubId);
+          }
+        } catch (stripeErr) {
+          // Subscription doesn't exist in Stripe
+          if (stripeErr.code === 'resource_missing' || stripeErr.message?.includes('No such subscription')) {
+            await prisma.subscription.update({
+              where: { id: sub.id },
+              data: { 
+                status: 'canceled',
+                updatedAt: new Date()
+              }
+            });
+            cleanedCount++;
+            console.log('[cleanup] Removed stale subscription:', stripeSubId);
+          } else {
+            errors.push({ subId: stripeSubId, error: stripeErr.message });
+            console.error('[cleanup] Error checking subscription:', stripeErr.message);
+          }
+        }
+      }
+    }
+
+    res.json({
+      ok: true,
+      cleaned: cleanedCount,
+      errors: errors.length > 0 ? errors : undefined,
+      message: cleanedCount > 0 
+        ? `Cleaned up ${cleanedCount} stale subscription(s)` 
+        : 'No stale subscriptions found'
+    });
+
+  } catch (e) {
+    console.error('[cleanup_subscriptions] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to cleanup subscriptions', 
+      detail: e?.message 
+    });
+  }
+});
+
 // ---------- Stripe webhooks ----------
 app.post('/webhooks/stripe', async (req, res) => {
   let event;
