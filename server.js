@@ -873,12 +873,7 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user?.email) return res.status(400).json({ error: 'missing_email' });
 
-    // If already premium, block renew
-    if (await userHasActivePremium(userId)) {
-      return res.status(400).json({ error: 'already_active' });
-    }
-
-    // Get a *verified* existing customer id if we have one
+    // Get verified customer id if exists
     const verifiedCustomerId = await getValidCustomerIdForUser(userId, user.email);
 
     const session = await stripe.checkout.sessions.create({
@@ -892,10 +887,12 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
       allow_promotion_codes: true,
     });
 
+    console.log('[checkout_renew] Created checkout session for', user.email);
     return res.json({ url: session.url });
+    
   } catch (e) {
-    console.error('[checkout_renew] error:', e);
-    return res.status(500).json({ error: 'Checkout failed' });
+    console.error('[checkout_renew] error:', e?.message || e);
+    return res.status(500).json({ error: 'Checkout failed', detail: e?.message });
   }
 });
 
