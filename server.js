@@ -79,16 +79,30 @@ const log = (...a) => console.log(...a);
 const isEmail = (s) => typeof s === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
 
 const signAccess = (user) =>
-  jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
+  jwt.sign({ sub: user.id, email: user.email, type: 'access' }, JWT_SECRET, { expiresIn: '1h' });
+
+const signRefresh = (user) =>
+  jwt.sign({ sub: user.id, email: user.email, type: 'refresh' }, JWT_SECRET, { expiresIn: '30d' });
 
 function auth(req, res, next) {
   try {
     const h = req.headers.authorization || '';
     const [, token] = h.split(' ');
     if (!token) return res.status(401).json({ error: 'Missing bearer token' });
-    req.user = jwt.verify(token, JWT_SECRET);
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Ensure this is an access token, not a refresh token
+    if (decoded.type !== 'access') {
+      return res.status(401).json({ error: 'Invalid token type' });
+    }
+    
+    req.user = decoded;
     next();
-  } catch {
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token expired', code: 'TOKEN_EXPIRED' });
+    }
     res.status(401).json({ error: 'Invalid token' });
   }
 }
@@ -321,14 +335,64 @@ app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+    
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase().trim() } });
     if (!user || !user.passwordHash) return res.status(401).json({ error: 'Invalid credentials' });
+    
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    res.json({ access: signAccess(user) });
+    
+    // Return both access and refresh tokens
+    res.json({ 
+      access: signAccess(user),
+      refresh: signRefresh(user)
+    });
   } catch (e) {
     console.error('[login] error:', e?.message || e);
     res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// ---------- REFRESH ENDPOINT ----------
+app.post('/auth/refresh', async (req, res) => {
+  try {
+    const { refresh } = req.body || {};
+    if (!refresh) {
+      return res.status(400).json({ error: 'Missing refresh token' });
+    }
+
+    // Verify the refresh token
+    let decoded;
+    try {
+      decoded = jwt.verify(refresh, JWT_SECRET);
+    } catch (err) {
+      if (err.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: 'Refresh token expired', code: 'REFRESH_EXPIRED' });
+      }
+      return res.status(401).json({ error: 'Invalid refresh token' });
+    }
+
+    // Ensure this is a refresh token, not an access token
+    if (decoded.type !== 'refresh') {
+      return res.status(401).json({ error: 'Invalid token type' });
+    }
+
+    // Verify user still exists
+    const user = await prisma.user.findUnique({ where: { id: decoded.sub } });
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    // Issue new access token (and optionally a new refresh token)
+    res.json({ 
+      access: signAccess(user),
+      refresh: signRefresh(user) // Issue new refresh token for extended sessions
+    });
+    
+    log(`[refresh] issued new tokens for user ${user.email}`);
+  } catch (e) {
+    console.error('[refresh] error:', e?.message || e);
+    res.status(500).json({ error: 'Token refresh failed' });
   }
 });
 
