@@ -931,7 +931,6 @@ app.post('/billing/checkout_public', async (req, res) => {
 });
 
 // AUTH'D RENEW CHECKOUT (ONLY WHEN NO ACTIVE PREMIUM)
-// AUTH'D RENEW CHECKOUT - FIXED for Stripe subscription mode
 app.post('/billing/checkout_renew', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -990,6 +989,396 @@ app.get('/billing/price_check', async (_req, res) => {
   } catch (e) {
     console.error('[price_check] error:', e?.message);
     res.status(500).json({ error: e?.message || 'price check failed' });
+  }
+});
+
+// ============================================================================
+// Device Management Endpoints
+// ============================================================================
+
+
+// ---------- Device Management Helper Functions ----------
+
+async function generateDeviceResetTokens(userId) {
+  // Create or get existing reset tokens
+  const tokens = await prisma.deviceResetToken.upsert({
+    where: { userId },
+    create: { userId, tokensRemaining: 2 },
+    update: {} // Don't modify if exists
+  });
+  return tokens;
+}
+
+async function canResetDevice(userId) {
+  const tokens = await prisma.deviceResetToken.findUnique({
+    where: { userId }
+  });
+  
+  if (!tokens) return { canReset: true, tokensRemaining: 2 }; // New user
+  
+  // Check if they have tokens remaining
+  if (tokens.tokensRemaining > 0) {
+    return { canReset: true, tokensRemaining: tokens.tokensRemaining };
+  }
+  
+  // Check if 30 days have passed since last reset
+  if (tokens.lastResetAt) {
+    const daysSinceReset = (Date.now() - tokens.lastResetAt.getTime()) / (1000 * 60 * 60 * 24);
+    if (daysSinceReset >= 30) {
+      // Grant new token
+      await prisma.deviceResetToken.update({
+        where: { userId },
+        data: { tokensRemaining: 1, lastResetAt: null }
+      });
+      return { canReset: true, tokensRemaining: 1 };
+    }
+    
+    const daysUntilReset = Math.ceil(30 - daysSinceReset);
+    return { 
+      canReset: false, 
+      tokensRemaining: 0,
+      daysUntilReset 
+    };
+  }
+  
+  return { canReset: false, tokensRemaining: 0 };
+}
+
+function getDeviceFingerprint(req) {
+  // Get IP address and user agent for audit
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || 
+             req.headers['x-real-ip'] || 
+             req.connection.remoteAddress;
+  return { ip };
+}
+
+// ---------- Device Registration Endpoint ----------
+app.post('/devices/register', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { deviceId, deviceName, appType, platform } = req.body || {};
+    
+    // Validate inputs
+    if (!deviceId || !appType || !platform) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    if (!['commander', 'server-manager'].includes(appType)) {
+      return res.status(400).json({ error: 'Invalid appType' });
+    }
+    
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+    
+    // Check if this device is already registered
+    const existing = await prisma.device.findUnique({
+      where: { 
+        userId_deviceId_appType: { userId, deviceId, appType } 
+      }
+    });
+    
+    if (existing) {
+      // Update last seen
+      await prisma.device.update({
+        where: { id: existing.id },
+        data: { lastSeenAt: new Date(), active: true }
+      });
+      
+      return res.json({ 
+        ok: true, 
+        device: existing,
+        message: 'Device already registered' 
+      });
+    }
+    
+    // Check if another device is registered for this app type
+    const otherDevice = await prisma.device.findFirst({
+      where: { 
+        userId, 
+        appType,
+        active: true,
+        id: { not: existing?.id }
+      }
+    });
+    
+    if (otherDevice) {
+      // Another device exists - cannot register
+      return res.status(409).json({ 
+        error: 'Device limit reached',
+        code: 'DEVICE_LIMIT_REACHED',
+        existingDevice: {
+          name: otherDevice.deviceName,
+          registeredAt: otherDevice.registeredAt,
+          lastSeenAt: otherDevice.lastSeenAt
+        },
+        message: `Only one ${appType} device allowed. Use a device reset token to switch devices.`
+      });
+    }
+    
+    // Register new device
+    const device = await prisma.device.create({
+      data: {
+        userId,
+        deviceId,
+        deviceName: deviceName || `${platform} Device`,
+        appType,
+        platform,
+        active: true
+      }
+    });
+    
+    // Ensure user has reset tokens
+    await generateDeviceResetTokens(userId);
+    
+    // Audit log
+    const { ip } = getDeviceFingerprint(req);
+    await prisma.deviceAuditLog.create({
+      data: {
+        userId,
+        deviceId,
+        appType,
+        action: 'registered',
+        ipAddress: ip
+      }
+    });
+    
+    log(`[device] registered: user=${userId} device=${deviceId} app=${appType}`);
+    
+    res.json({ ok: true, device });
+  } catch (e) {
+    console.error('[devices/register] error:', e?.message || e);
+    res.status(500).json({ error: 'Device registration failed' });
+  }
+});
+
+// ---------- Device Verification Endpoint ----------
+app.post('/devices/verify', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { deviceId, appType } = req.body || {};
+    
+    if (!deviceId || !appType) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    // Check if device is registered and active
+    const device = await prisma.device.findUnique({
+      where: { 
+        userId_deviceId_appType: { userId, deviceId, appType } 
+      }
+    });
+    
+    if (!device || !device.active) {
+      return res.status(403).json({ 
+        error: 'Device not authorized',
+        code: 'DEVICE_NOT_AUTHORIZED',
+        registered: !!device
+      });
+    }
+    
+    // Update last seen
+    await prisma.device.update({
+      where: { id: device.id },
+      data: { lastSeenAt: new Date() }
+    });
+    
+    res.json({ ok: true, authorized: true });
+  } catch (e) {
+    console.error('[devices/verify] error:', e?.message || e);
+    res.status(500).json({ error: 'Device verification failed' });
+  }
+});
+
+// ---------- List User Devices ----------
+app.get('/devices', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    const devices = await prisma.device.findMany({
+      where: { userId },
+      orderBy: { lastSeenAt: 'desc' }
+    });
+    
+    // Get reset token info
+    const resetTokens = await prisma.deviceResetToken.findUnique({
+      where: { userId }
+    });
+    
+    const canReset = await canResetDevice(userId);
+    
+    res.json({ 
+      devices,
+      resetTokens: {
+        remaining: canReset.tokensRemaining,
+        canReset: canReset.canReset,
+        daysUntilReset: canReset.daysUntilReset || null,
+        lastResetAt: resetTokens?.lastResetAt || null
+      }
+    });
+  } catch (e) {
+    console.error('[devices] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to fetch devices' });
+  }
+});
+
+// ---------- Reset Device (Deactivate Current) ----------
+app.post('/devices/reset', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { appType } = req.body || {};
+    
+    if (!appType) {
+      return res.status(400).json({ error: 'Missing appType' });
+    }
+    
+    // Check if user can reset
+    const resetStatus = await canResetDevice(userId);
+    if (!resetStatus.canReset) {
+      return res.status(403).json({ 
+        error: 'No reset tokens available',
+        code: 'NO_RESET_TOKENS',
+        daysUntilReset: resetStatus.daysUntilReset
+      });
+    }
+    
+    // Deactivate all devices for this app type
+    const result = await prisma.device.updateMany({
+      where: { userId, appType, active: true },
+      data: { active: false }
+    });
+    
+    // Consume reset token
+    await prisma.deviceResetToken.update({
+      where: { userId },
+      data: { 
+        tokensRemaining: { decrement: 1 },
+        lastResetAt: new Date()
+      }
+    });
+    
+    // Audit log
+    const { ip } = getDeviceFingerprint(req);
+    await prisma.deviceAuditLog.create({
+      data: {
+        userId,
+        deviceId: 'ALL',
+        appType,
+        action: 'reset',
+        reason: `Used reset token. ${resetStatus.tokensRemaining - 1} remaining.`,
+        ipAddress: ip
+      }
+    });
+    
+    log(`[device] reset: user=${userId} app=${appType} devicesDeactivated=${result.count}`);
+    
+    res.json({ 
+      ok: true, 
+      devicesDeactivated: result.count,
+      tokensRemaining: resetStatus.tokensRemaining - 1
+    });
+  } catch (e) {
+    console.error('[devices/reset] error:', e?.message || e);
+    res.status(500).json({ error: 'Device reset failed' });
+  }
+});
+
+// ---------- Remove Specific Device ----------
+app.delete('/devices/:deviceId', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { deviceId } = req.params;
+    const { appType } = req.body || {};
+    
+    if (!appType) {
+      return res.status(400).json({ error: 'Missing appType' });
+    }
+    
+    // Check if user can reset
+    const resetStatus = await canResetDevice(userId);
+    if (!resetStatus.canReset) {
+      return res.status(403).json({ 
+        error: 'No reset tokens available',
+        code: 'NO_RESET_TOKENS',
+        daysUntilReset: resetStatus.daysUntilReset
+      });
+    }
+    
+    // Find and deactivate the device
+    const device = await prisma.device.findUnique({
+      where: { 
+        userId_deviceId_appType: { userId, deviceId, appType } 
+      }
+    });
+    
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+    
+    await prisma.device.update({
+      where: { id: device.id },
+      data: { active: false }
+    });
+    
+    // Consume reset token
+    await prisma.deviceResetToken.update({
+      where: { userId },
+      data: { 
+        tokensRemaining: { decrement: 1 },
+        lastResetAt: new Date()
+      }
+    });
+    
+    // Audit log
+    const { ip } = getDeviceFingerprint(req);
+    await prisma.deviceAuditLog.create({
+      data: {
+        userId,
+        deviceId,
+        appType,
+        action: 'unregistered',
+        reason: 'User removed device',
+        ipAddress: ip
+      }
+    });
+    
+    log(`[device] removed: user=${userId} device=${deviceId} app=${appType}`);
+    
+    res.json({ 
+      ok: true,
+      tokensRemaining: resetStatus.tokensRemaining - 1
+    });
+  } catch (e) {
+    console.error('[devices/remove] error:', e?.message || e);
+    res.status(500).json({ error: 'Device removal failed' });
+  }
+});
+
+// ---------- Device Audit Log (Admin) ----------
+app.get('/devices/audit', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Optional: check if user is admin
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user?.isAdmin) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    const { userId: targetUserId } = req.query;
+    
+    const logs = await prisma.deviceAuditLog.findMany({
+      where: targetUserId ? { userId: targetUserId } : {},
+      orderBy: { createdAt: 'desc' },
+      take: 100
+    });
+    
+    res.json({ logs });
+  } catch (e) {
+    console.error('[devices/audit] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
   }
 });
 
