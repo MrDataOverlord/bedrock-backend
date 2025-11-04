@@ -1074,7 +1074,7 @@ app.post('/devices/register', auth, async (req, res) => {
     }
     
     // Check if this device is already registered
-    const existing = await prisma.device.findUnique({
+    const existing = await prisma.authorizedDevice.findUnique({
       where: { 
         userId_deviceId_appType: { userId, deviceId, appType } 
       }
@@ -1082,7 +1082,7 @@ app.post('/devices/register', auth, async (req, res) => {
     
     if (existing) {
       // Update last seen
-      await prisma.device.update({
+      await prisma.authorizedDevice.update({
         where: { id: existing.id },
         data: { lastSeenAt: new Date(), active: true }
       });
@@ -1095,7 +1095,7 @@ app.post('/devices/register', auth, async (req, res) => {
     }
     
     // Check if another device is registered for this app type
-    const otherDevice = await prisma.device.findFirst({
+    const otherDevice = await prisma.authorizedDevice.findFirst({
       where: { 
         userId, 
         appType,
@@ -1119,7 +1119,7 @@ app.post('/devices/register', auth, async (req, res) => {
     }
     
     // Register new device
-    const device = await prisma.device.create({
+    const device = await prisma.authorizedDevice.create({
       data: {
         userId,
         deviceId,
@@ -1165,7 +1165,7 @@ app.post('/devices/verify', auth, async (req, res) => {
     }
     
     // Check if device is registered and active
-    const device = await prisma.device.findUnique({
+    const device = await prisma.authorizedDevice.findUnique({
       where: { 
         userId_deviceId_appType: { userId, deviceId, appType } 
       }
@@ -1180,7 +1180,7 @@ app.post('/devices/verify', auth, async (req, res) => {
     }
     
     // Update last seen
-    await prisma.device.update({
+    await prisma.authorizedDevice.update({
       where: { id: device.id },
       data: { lastSeenAt: new Date() }
     });
@@ -1197,7 +1197,7 @@ app.get('/devices', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
     
-    const devices = await prisma.device.findMany({
+    const devices = await prisma.authorizedDevice.findMany({
       where: { userId },
       orderBy: { lastSeenAt: 'desc' }
     });
@@ -1245,7 +1245,7 @@ app.post('/devices/reset', auth, async (req, res) => {
     }
     
     // Deactivate all devices for this app type
-    const result = await prisma.device.updateMany({
+    const result = await prisma.authorizedDevice.updateMany({
       where: { userId, appType, active: true },
       data: { active: false }
     });
@@ -1307,7 +1307,7 @@ app.delete('/devices/:deviceId', auth, async (req, res) => {
     }
     
     // Find and deactivate the device
-    const device = await prisma.device.findUnique({
+    const device = await prisma.authorizedDevice.findUnique({
       where: { 
         userId_deviceId_appType: { userId, deviceId, appType } 
       }
@@ -1317,7 +1317,7 @@ app.delete('/devices/:deviceId', auth, async (req, res) => {
       return res.status(404).json({ error: 'Device not found' });
     }
     
-    await prisma.device.update({
+    await prisma.authorizedDevice.update({
       where: { id: device.id },
       data: { active: false }
     });
