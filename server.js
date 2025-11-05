@@ -1082,19 +1082,47 @@ function getDeviceFingerprint(req) {
 }
 
 // ============================================================================
-// DEVICE VERIFICATION HELPER
+// DEVICE VERIFICATION HELPER FUNCTION
 // ============================================================================
 
-// Helper function to verify device authorization
-async function verifyDeviceAuthorization(userId, deviceId, appType = 'commander') {
-  if (!deviceId) {
-    // If no device ID provided, allow for backward compatibility
-    // (Remove this once all clients send device IDs)
-    console.log('[verifyDeviceAuthorization] No device ID provided, allowing access');
-    return true;
-  }
+async function verifyPremiumDevice(req, res) {
+  const userId = req.user.userId;
+  const deviceId = req.body.deviceId || req.query.deviceId || req.headers['x-device-id'];
+  const appType = req.body.appType || req.query.appType || 'commander';
+
+  console.log(`[DEVICE_CHECK] Verifying device for user ${userId}, deviceId: ${deviceId}, appType: ${appType}`);
 
   try {
+    // Check if user has premium
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        orgs: {
+          include: {
+            subscriptions: {
+              where: {
+                status: 'active',
+                currentPeriodEnd: { gt: new Date() }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    const hasPremium = user?.orgs?.some(org => org.subscriptions?.length > 0);
+    if (!hasPremium) {
+      console.log(`[DEVICE_CHECK] User ${userId} does not have premium`);
+      return { authorized: false, error: 'Premium subscription required' };
+    }
+
+    // If no device ID provided, allow (backward compatibility during transition)
+    if (!deviceId) {
+      console.log(`[DEVICE_CHECK] No device ID provided, allowing access (backward compatibility)`);
+      return { authorized: true };
+    }
+
+    // Check if device is authorized
     const device = await prisma.authorizedDevice.findFirst({
       where: {
         userId,
@@ -1105,8 +1133,8 @@ async function verifyDeviceAuthorization(userId, deviceId, appType = 'commander'
     });
 
     if (!device) {
-      console.log('[verifyDeviceAuthorization] Device not found or not active');
-      return false;
+      console.log(`[DEVICE_CHECK] Device not authorized for user ${userId}`);
+      return { authorized: false, error: 'Device not authorized. Please manage your devices in the Premium menu.' };
     }
 
     // Update last seen
@@ -1115,11 +1143,11 @@ async function verifyDeviceAuthorization(userId, deviceId, appType = 'commander'
       data: { lastSeenAt: new Date() }
     });
 
-    console.log('[verifyDeviceAuthorization] Device authorized:', device.deviceName);
-    return true;
+    console.log(`[DEVICE_CHECK] Device ${device.deviceName} authorized for user ${userId}`);
+    return { authorized: true };
   } catch (error) {
-    console.error('[verifyDeviceAuthorization] error:', error);
-    return false;
+    console.error('[DEVICE_CHECK] Error:', error);
+    return { authorized: false, error: 'Device verification failed' };
   }
 }
 
