@@ -241,6 +241,18 @@ async function sendRegistrationEmail(email, rawToken) {
   log('[mail] sent:', email, 'messageId:', info.messageId);
 }
 
+// ---------- password policy ----------
+function validatePasswordPolicy(pw) {
+  const issues = [];
+  const s = String(pw || '');
+  if (s.length < 8) issues.push('at least 8 characters');
+  if (/\s/.test(s)) issues.push('no spaces');
+  if (!(/[0-9]/.test(s) || /[~`!@#$%^&*()\-\_=+\[\]{}|\\;:'",.<>/?]/.test(s))) {
+    issues.push('include a number or a symbol');
+  }
+  return { ok: issues.length === 0, issues };
+}
+
 // ---------- Stripe raw-body ----------
 app.use(express.json({
   verify: (req, _res, buf) => {
@@ -399,8 +411,17 @@ app.post('/auth/refresh', async (req, res) => {
 // ----- Registration completion (FIXED token validation) -----
 app.post('/auth/register/complete', async (req, res) => {
   try {
-    const { token, password } = req.body || {};
+    const { token, password, confirm } = req.body || {};
     if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
+
+    // Policy enforcement
+    const v = validatePasswordPolicy(password);
+    if (!v.ok) return res.status(400).json({ error: `Password requirements: ${v.issues.join(', ')}` });
+
+    // Optional confirm check (harmless if client doesn’t send it)
+    if (typeof confirm === 'string' && confirm !== password) {
+      return res.status(400).json({ error: 'Passwords do not match' });
+    }
 
     // Get all unused registration tokens and find the matching one
     const tokens = await prisma.passwordToken.findMany({
@@ -520,8 +541,16 @@ app.post('/auth/reset/start', async (req, res) => {
 // ----- Forgot password (complete) -----
 app.post('/auth/reset/complete', async (req, res) => {
   try {
-    const { token, newPassword } = req.body || {};
+    const { token, newPassword, confirmPassword } = req.body || {};
     if (!token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
+
+    // Policy enforcement
+    const v = validatePasswordPolicy(newPassword);
+    if (!v.ok) return res.status(400).json({ error: `Password requirements: ${v.issues.join(', ')}` });
+
+    if (typeof confirmPassword === 'string' && confirmPassword !== newPassword) {
+      return res.status(400).json({ error: 'Passwords do not match' });
+    }
 
     // Get all unused reset tokens and find the matching one
     const tokens = await prisma.passwordToken.findMany({
