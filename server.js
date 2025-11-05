@@ -1052,6 +1052,48 @@ function getDeviceFingerprint(req) {
   return { ip };
 }
 
+// ============================================================================
+// DEVICE VERIFICATION HELPER
+// ============================================================================
+
+// Helper function to verify device authorization
+async function verifyDeviceAuthorization(userId, deviceId, appType = 'commander') {
+  if (!deviceId) {
+    // If no device ID provided, allow for backward compatibility
+    // (Remove this once all clients send device IDs)
+    console.log('[verifyDeviceAuthorization] No device ID provided, allowing access');
+    return true;
+  }
+
+  try {
+    const device = await prisma.authorizedDevice.findFirst({
+      where: {
+        userId,
+        deviceId,
+        appType,
+        active: true
+      }
+    });
+
+    if (!device) {
+      console.log('[verifyDeviceAuthorization] Device not found or not active');
+      return false;
+    }
+
+    // Update last seen
+    await prisma.authorizedDevice.update({
+      where: { id: device.id },
+      data: { lastSeenAt: new Date() }
+    });
+
+    console.log('[verifyDeviceAuthorization] Device authorized:', device.deviceName);
+    return true;
+  } catch (error) {
+    console.error('[verifyDeviceAuthorization] error:', error);
+    return false;
+  }
+}
+
 // ---------- Device Registration Endpoint ----------
 app.post('/devices/register', auth, async (req, res) => {
   try {
@@ -2121,11 +2163,18 @@ app.post('/webhooks/stripe', async (req, res) => {
 
 // ---------- Premium Features (Server-Side Validation) ----------
 
+// ============================================================================
+// NOTIFICATION ENDPOINTS
+// ============================================================================
+
 // Get user's notification settings
 app.get('/premium/notifications/settings', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
+    
     console.log('[DEBUG] Getting notification settings for user:', userId);
+    console.log('[DEBUG] Device ID:', deviceId);
     
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
@@ -2133,6 +2182,13 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
     
     if (!hasPremium) {
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[DEBUG] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     // Get or create default notification settings
@@ -2185,9 +2241,11 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
 app.post('/premium/notifications/rule', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
     const { name, type, pattern, soundFile, enabled } = req.body || {};
 
     console.log('[RULE_UPDATE] Update request for user:', userId);
+    console.log('[RULE_UPDATE] Device ID:', deviceId);
     console.log('[RULE_UPDATE] Request body:', { name, type, pattern, soundFile, enabled });
 
     // Validate required fields
@@ -2201,6 +2259,13 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
     if (!hasPremium) {
       console.log('[RULE_UPDATE] User does not have premium');
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[RULE_UPDATE] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     // Get user's notification settings
@@ -2274,17 +2339,27 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
   }
 });
 
-// Reset notification rules to defaults:
+// Reset notification rules to defaults
 app.post('/premium/notifications/reset', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
+    
     console.log('[DEBUG] Reset request for user:', userId);
+    console.log('[DEBUG] Device ID:', deviceId);
 
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
       console.log('[DEBUG] User does not have premium');
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[DEBUG] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     console.log('[DEBUG] Resetting notification rules to updated Bedrock patterns...');
@@ -2345,12 +2420,22 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
 app.post('/premium/notifications/sound', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
     const { enabled } = req.body || {};
+
+    console.log('[SOUND_TOGGLE] User:', userId, 'Device:', deviceId, 'Enabled:', enabled);
 
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[SOUND_TOGGLE] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     await prisma.notificationSettings.upsert({
@@ -2370,15 +2455,23 @@ app.post('/premium/notifications/sound', auth, async (req, res) => {
 app.get('/premium/sounds/:filename', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
     const { filename } = req.params;
 
-    console.log(`[premium/sounds] Request for sound: ${filename} by user: ${userId}`);
+    console.log(`[premium/sounds] Request for sound: ${filename} by user: ${userId}, device: ${deviceId}`);
 
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
       console.log(`[premium/sounds] User ${userId} does not have premium`);
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log(`[premium/sounds] Device not authorized`);
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     // Validate filename for security
