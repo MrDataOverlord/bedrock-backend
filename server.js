@@ -2221,6 +2221,45 @@ app.post('/webhooks/stripe', async (req, res) => {
 // ---------- Premium Features (Server-Side Validation) ----------
 
 // ============================================================================
+// DEVICE AUTHORIZATION HELPER
+// ============================================================================
+async function verifyDeviceAuthorization(userId, deviceId, appType = 'commander') {
+  if (!deviceId) {
+    // If no device ID provided, allow for backward compatibility
+    console.log('[verifyDeviceAuthorization] No device ID provided, allowing access');
+    return true;
+  }
+
+  try {
+    const device = await prisma.authorizedDevice.findFirst({
+      where: {
+        userId,
+        deviceId,
+        appType,
+        active: true
+      }
+    });
+
+    if (!device) {
+      console.log('[verifyDeviceAuthorization] Device not found or not active for user:', userId);
+      return false;
+    }
+
+    // Update last seen
+    await prisma.authorizedDevice.update({
+      where: { id: device.id },
+      data: { lastSeenAt: new Date() }
+    });
+
+    console.log('[verifyDeviceAuthorization] Device authorized:', device.deviceName);
+    return true;
+  } catch (error) {
+    console.error('[verifyDeviceAuthorization] error:', error);
+    return false;
+  }
+}
+
+// ============================================================================
 // NOTIFICATION ENDPOINTS
 // ============================================================================
 
