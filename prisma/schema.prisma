@@ -164,7 +164,7 @@ model User {
   isAdmin              Boolean               @default(false)
   maxWindowsDevices    Int?                  @default(1)
   maxLinuxDevices      Int?                  @default(1)
-  AuthorizedDevice     AuthorizedDevice[]
+  authorizedDevices    AuthorizedDevice[]
   DeviceResetToken     DeviceResetToken?
   Member               Member[]
   NotificationSettings NotificationSettings?
