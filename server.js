@@ -1860,13 +1860,12 @@ app.post('/admin/users/grant_reset_tokens', adminAuth, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Upsert reset tokens
+    // ⭐ FIXED: Removed appType field
     await prisma.deviceResetToken.upsert({
       where: { userId: user.id },
       create: {
         userId: user.id,
-        tokensRemaining: tokensToAdd,
-        appType: 'commander'
+        tokensRemaining: tokensToAdd
       },
       update: {
         tokensRemaining: { increment: tokensToAdd }
