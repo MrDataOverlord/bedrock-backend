@@ -1028,15 +1028,17 @@ app.get('/billing/price_check', async (_req, res) => {
 
 // ---------- Device Management Helper Functions ----------
 
-async function generateDeviceResetTokens(userId) {
-  // Create or get existing reset tokens
-  const tokens = await prisma.deviceResetToken.upsert({
-    where: { userId },
-    create: { userId, tokensRemaining: 2 },
-    update: {} // Don't modify if exists
-  });
-  return tokens;
-}
+await prisma.deviceResetToken.upsert({
+  where: { userId: user.id },
+  create: {
+    id: `drt_${user.id}_${Date.now()}`,  // ⭐ ADD THIS LINE
+    userId: user.id,
+    tokensRemaining: tokensToAdd
+  },
+  update: {
+    tokensRemaining: { increment: tokensToAdd }
+  }
+});
 
 async function canResetDevice(userId) {
   const tokens = await prisma.deviceResetToken.findUnique({
