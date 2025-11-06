@@ -1142,6 +1142,7 @@ async function verifyPremiumDevice(req, res) {
 }
 
 // ---------- Device Registration Endpoint ----------
+// ---------- Device Registration Endpoint ----------
 app.post('/devices/register', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -1183,78 +1184,93 @@ app.post('/devices/register', auth, async (req, res) => {
       });
     }
     
-    // Check if another device is registered for this app type
     // Platform-specific device limit check
-const isWindows = platform.toLowerCase().includes('windows');
-const isLinux = platform.toLowerCase().includes('linux');
+    const isWindows = platform.toLowerCase().includes('windows');
+    const isLinux = platform.toLowerCase().includes('linux');
 
-// Get user's device limits
-const user = await prisma.user.findUnique({
-  where: { id: userId },
-  select: { 
-    maxWindowsDevices: true, 
-    maxLinuxDevices: true 
-  }
-});
-
-const maxAllowed = isWindows 
-  ? (user?.maxWindowsDevices || 1)
-  : isLinux 
-    ? (user?.maxLinuxDevices || 1)
-    : 1; // Default for other platforms
-
-// Count active devices for this platform + appType
-const platformKey = isWindows ? 'windows' : isLinux ? 'linux' : platform.toLowerCase();
-
-const activeDeviceCount = await prisma.authorizedDevice.count({
-  where: {
-    userId,
-    appType,
-    active: true,
-    platform: {
-      contains: platformKey,
-      mode: 'insensitive'
-    },
-    id: { not: existing?.id }
-  }
-});
-
-console.log(`[device/register] User ${userId} has ${activeDeviceCount}/${maxAllowed} active ${platformKey} devices for ${appType}`);
-
-if (activeDeviceCount >= maxAllowed) {
-  // Find the existing devices to show user
-  const existingDevices = await prisma.authorizedDevice.findMany({
-    where: {
-      userId,
-      appType,
-      active: true,
-      platform: {
-        contains: platformKey,
-        mode: 'insensitive'
+    // Get user's device limits
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { 
+        maxWindowsDevices: true, 
+        maxLinuxDevices: true 
       }
-    },
-    orderBy: { lastSeenAt: 'desc' },
-    take: 3
-  });
+    });
 
-  return res.status(409).json({ 
-    error: 'Device limit reached',
-    code: 'DEVICE_LIMIT_REACHED',
-    platform: platformKey,
-    currentCount: activeDeviceCount,
-    maxAllowed: maxAllowed,
-    existingDevices: existingDevices.map(d => ({
-      name: d.deviceName,
-      registeredAt: d.registeredAt,
-      lastSeenAt: d.lastSeenAt
-    })),
-    message: `Device limit reached for ${platformKey}. You have ${activeDeviceCount}/${maxAllowed} devices. Use a device reset token to switch devices.`
-  });
-}
+    const maxAllowed = isWindows 
+      ? (user?.maxWindowsDevices || 1)
+      : isLinux 
+        ? (user?.maxLinuxDevices || 1)
+        : 1;
+
+    // Count active devices for this platform + appType
+    const platformKey = isWindows ? 'windows' : isLinux ? 'linux' : platform.toLowerCase();
+
+    const activeDeviceCount = await prisma.authorizedDevice.count({
+      where: {
+        userId,
+        appType,
+        active: true,
+        platform: {
+          contains: platformKey,
+          mode: 'insensitive'
+        }
+      }
+    });
+
+    console.log(`[device/register] User ${userId} has ${activeDeviceCount}/${maxAllowed} active ${platformKey} devices for ${appType}`);
+
+    // ⭐ NEW: Check if slots available
+    const slotsAvailable = maxAllowed - activeDeviceCount;
+
+    if (slotsAvailable <= 0) {
+      // No slots available - get token info
+      const resetTokens = await prisma.deviceResetToken.findUnique({
+        where: { userId }
+      });
+
+      const tokensRemaining = resetTokens?.tokensRemaining || 0;
+
+      // Find the existing devices to show user
+      const existingDevices = await prisma.authorizedDevice.findMany({
+        where: {
+          userId,
+          appType,
+          active: true,
+          platform: {
+            contains: platformKey,
+            mode: 'insensitive'
+          }
+        },
+        orderBy: { lastSeenAt: 'desc' },
+        take: 5
+      });
+
+      return res.status(409).json({ 
+        error: 'Device limit reached',
+        code: 'DEVICE_LIMIT_REACHED',
+        platform: platformKey,
+        currentCount: activeDeviceCount,
+        maxAllowed: maxAllowed,
+        slotsAvailable: 0,  // ⭐ NEW
+        tokensRemaining: tokensRemaining,  // ⭐ NEW
+        existingDevices: existingDevices.map(d => ({
+          id: d.id,
+          name: d.deviceName,
+          deviceId: d.deviceId,
+          registeredAt: d.registeredAt,
+          lastSeenAt: d.lastSeenAt
+        })),
+        message: tokensRemaining > 0 
+          ? `Device limit reached. You have ${tokensRemaining} reset token(s) available.`
+          : `Device limit reached. No reset tokens available. Visit nerdherdmc.net/accounts to manage devices.`
+      });
+    }
     
-    // Register new device
+    // ✅ Slots available - register new device
     const device = await prisma.authorizedDevice.create({
       data: {
+        id: `dev_${userId}_${Date.now()}`,  // ⭐ ADD ID
         userId,
         deviceId,
         deviceName: deviceName || `${platform} Device`,
@@ -1271,6 +1287,7 @@ if (activeDeviceCount >= maxAllowed) {
     const { ip } = getDeviceFingerprint(req);
     await prisma.deviceAuditLog.create({
       data: {
+        id: `dal_${userId}_${Date.now()}`,  // ⭐ ADD ID
         userId,
         deviceId,
         appType,
@@ -1359,6 +1376,7 @@ app.get('/devices', auth, async (req, res) => {
 });
 
 // ---------- Reset Device (Deactivate Current) ----------
+// ---------- Reset Device (Deactivate Current) ----------
 app.post('/devices/reset', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -1389,7 +1407,8 @@ app.post('/devices/reset', auth, async (req, res) => {
       where: { userId },
       data: { 
         tokensRemaining: { decrement: 1 },
-        lastResetAt: new Date()
+        lastResetAt: new Date(),
+        updatedAt: new Date()  // ⭐ ADD THIS
       }
     });
     
@@ -1397,6 +1416,7 @@ app.post('/devices/reset', auth, async (req, res) => {
     const { ip } = getDeviceFingerprint(req);
     await prisma.deviceAuditLog.create({
       data: {
+        id: `dal_${userId}_${Date.now()}`,  // ⭐ ADD ID
         userId,
         deviceId: 'ALL',
         appType,
