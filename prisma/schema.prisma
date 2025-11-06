@@ -31,6 +31,8 @@ model User {
   createdAt     DateTime @default(now())
   
   // HWID Device Management System
+  maxWindowsDevices      Int       @default(1)
+  maxLinuxDevices        Int       @default(1)
   devices           AuthorizedDevice[]
   deviceResetTokens DeviceResetToken?
 
