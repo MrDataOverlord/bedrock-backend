@@ -121,7 +121,6 @@ model Org {
   createdAt        DateTime       @default(now())
   stripeCustomerId String?        @unique
   members          Member[]
-  members          Member[]       // ✅ Changed from "Member" to "members"
   User             User           @relation(fields: [ownerUserId], references: [id])
   subscriptions    Subscription[]
 
