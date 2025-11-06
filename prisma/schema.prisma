@@ -1,0 +1,174 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model AuthorizedDevice {
+  id           String   @id
+  userId       String
+  deviceId     String
+  deviceName   String
+  appType      String
+  platform     String
+  lastSeenAt   DateTime @default(now())
+  registeredAt DateTime @default(now())
+  active       Boolean  @default(true)
+  User         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId, appType])
+  @@index([deviceId])
+  @@index([userId, appType])
+  @@index([userId])
+}
+
+model Device {
+  id        String   @id
+  deviceId  String
+  platform  String
+  pushToken String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime
+}
+
+model DeviceAuditLog {
+  id        String   @id
+  userId    String
+  deviceId  String
+  appType   String
+  action    String
+  reason    String?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([deviceId])
+  @@index([userId])
+}
+
+model DeviceResetToken {
+  id              String    @id
+  userId          String    @unique
+  tokensRemaining Int       @default(2)
+  lastResetAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime
+  User            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Member {
+  id        String   @id
+  orgId     String
+  userId    String
+  role      String   @default("owner")
+  createdAt DateTime @default(now())
+  Org       Org      @relation(fields: [orgId], references: [id])
+  User      User     @relation(fields: [userId], references: [id])
+
+  @@unique([orgId, userId])
+  @@index([orgId])
+  @@index([userId])
+}
+
+model NotificationRule {
+  id                   String               @id
+  settingsId           String
+  name                 String
+  type                 String               @default("contains")
+  pattern              String
+  soundFile            String               @default("default.wav")
+  enabled              Boolean              @default(true)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @default(now())
+  NotificationSettings NotificationSettings @relation(fields: [settingsId], references: [id], onDelete: Cascade)
+
+  @@index([settingsId])
+}
+
+model NotificationSettings {
+  id               String             @id
+  userId           String             @unique
+  soundEnabled     Boolean            @default(false)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @default(now())
+  NotificationRule NotificationRule[]
+  User             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model NotificationTrigger {
+  id          String   @id
+  userId      String
+  ruleName    String
+  triggeredAt DateTime @default(now())
+  lineLength  Int      @default(0)
+  User        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([triggeredAt])
+  @@index([userId])
+}
+
+model Org {
+  id               String         @id
+  ownerUserId      String
+  name             String         @default("My Org")
+  createdAt        DateTime       @default(now())
+  stripeCustomerId String?        @unique
+  Member           Member[]
+  User             User           @relation(fields: [ownerUserId], references: [id])
+  Subscription     Subscription[]
+
+  @@index([ownerUserId])
+}
+
+model PasswordToken {
+  id        String    @id
+  userId    String
+  purpose   String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  User      User      @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model Subscription {
+  id               String    @id
+  orgId            String
+  provider         String
+  status           String
+  currentPeriodEnd DateTime?
+  customerId       String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime
+  Org              Org       @relation(fields: [orgId], references: [id])
+
+  @@index([orgId])
+  @@index([provider])
+}
+
+model User {
+  id                   String                @id
+  email                String                @unique
+  passwordHash         String?
+  totpSecret           String?
+  createdAt            DateTime              @default(now())
+  isAdmin              Boolean               @default(false)
+  maxWindowsDevices    Int?                  @default(1)
+  maxLinuxDevices      Int?                  @default(1)
+  AuthorizedDevice     AuthorizedDevice[]
+  DeviceResetToken     DeviceResetToken?
+  Member               Member[]
+  NotificationSettings NotificationSettings?
+  NotificationTrigger  NotificationTrigger[]
+  Org                  Org[]
+  PasswordToken        PasswordToken[]
+}
