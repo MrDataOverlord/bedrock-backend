@@ -1028,18 +1028,6 @@ app.get('/billing/price_check', async (_req, res) => {
 
 // ---------- Device Management Helper Functions ----------
 
-await prisma.deviceResetToken.upsert({
-  where: { userId: user.id },
-  create: {
-    id: `drt_${user.id}_${Date.now()}`,  // ⭐ ADD THIS LINE
-    userId: user.id,
-    tokensRemaining: tokensToAdd
-  },
-  update: {
-    tokensRemaining: { increment: tokensToAdd }
-  }
-});
-
 async function canResetDevice(userId) {
   const tokens = await prisma.deviceResetToken.findUnique({
     where: { userId }
@@ -1839,6 +1827,7 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
 });
 
 // Grant reset tokens to a user
+// Grant reset tokens to a user
 app.post('/admin/users/grant_reset_tokens', adminAuth, async (req, res) => {
   try {
     const { email, tokens } = req.body;
@@ -1862,10 +1851,11 @@ app.post('/admin/users/grant_reset_tokens', adminAuth, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // ⭐ FIXED: Removed appType field
+    // Upsert reset tokens (with ID for create)
     await prisma.deviceResetToken.upsert({
       where: { userId: user.id },
       create: {
+        id: `drt_${user.id}_${Date.now()}`,  // ⭐ ADDED: Required ID field
         userId: user.id,
         tokensRemaining: tokensToAdd
       },
