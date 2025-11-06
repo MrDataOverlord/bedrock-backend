@@ -120,9 +120,9 @@ model Org {
   name             String         @default("My Org")
   createdAt        DateTime       @default(now())
   stripeCustomerId String?        @unique
-  Member           Member[]
+  members          Member[]
   User             User           @relation(fields: [ownerUserId], references: [id])
-  Subscription     Subscription[]
+  subscriptions    Subscription[]
 
   @@index([ownerUserId])
 }
