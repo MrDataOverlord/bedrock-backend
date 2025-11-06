@@ -1142,7 +1142,6 @@ async function verifyPremiumDevice(req, res) {
 }
 
 // ---------- Device Registration Endpoint ----------
-// ---------- Device Registration Endpoint ----------
 app.post('/devices/register', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
@@ -1846,7 +1845,6 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
   }
 });
 
-// Grant reset tokens to a user
 // Grant reset tokens to a user
 app.post('/admin/users/grant_reset_tokens', adminAuth, async (req, res) => {
   try {
