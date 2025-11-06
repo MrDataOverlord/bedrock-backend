@@ -121,7 +121,7 @@ model Org {
   createdAt        DateTime       @default(now())
   stripeCustomerId String?        @unique
   members          Member[]
-  User             User           @relation(fields: [ownerUserId], references: [id])
+  owner            User           @relation("OrgOwner", fields: [ownerUserId], references: [id])
   subscriptions    Subscription[]
 
   @@index([ownerUserId])
