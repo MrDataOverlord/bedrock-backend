@@ -7,10 +7,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// =======================
-// Core
-// =======================
-
 model Device {
   id        String   @id @default(cuid())
   deviceId  String
@@ -21,34 +17,32 @@ model Device {
 }
 
 model User {
-  id            String   @id @default(cuid())
-  email         String   @unique
-  passwordHash  String?
-  totpSecret    String?
-  isAdmin       Boolean  @default(false) 
-  createdAt     DateTime @default(now())
-
-  ownedOrgs      Org[]
-  memberships    Member[]
-  passwordTokens PasswordToken[]
-  
-  // Premium notification relations
-  notificationSettings NotificationSettings?
-  notificationTriggers NotificationTrigger[]
+  id                   String                @id @default(cuid())
+  email                String                @unique
+  passwordHash         String?
+  totpSecret           String?
+  createdAt            DateTime              @default(now())
+  isAdmin              Boolean               @default(false)
+  maxWindowsDevices    Int?                  @default(1)
+  maxLinuxDevices      Int?                  @default(1)
+  AuthorizedDevice     AuthorizedDevice[]
+  DeviceResetToken     DeviceResetToken?
+  memberships          Member[]
+  NotificationSettings NotificationSettings?
+  NotificationTrigger  NotificationTrigger[]
+  ownedOrgs            Org[]
+  passwordTokens       PasswordToken[]
 }
 
 model Org {
-  id               String   @id @default(cuid())
-  ownerUserId      String?          // optional so webhooks can create org first
-  name             String   @default("My Org")
-  createdAt        DateTime @default(now())
-
-  // Required by server.js to link Stripe customer to this org
-  stripeCustomerId String?  @unique
-
-  owner         User?          @relation(fields: [ownerUserId], references: [id])
-  members       Member[]
-  subscriptions Subscription[]
+  id               String         @id @default(cuid())
+  ownerUserId      String
+  name             String         @default("My Org")
+  createdAt        DateTime       @default(now())
+  stripeCustomerId String?        @unique
+  members          Member[]
+  owner            User           @relation(fields: [ownerUserId], references: [id])
+  subscriptions    Subscription[]
 
   @@index([ownerUserId])
 }
@@ -59,96 +53,122 @@ model Member {
   userId    String
   role      String   @default("owner")
   createdAt DateTime @default(now())
+  org       Org      @relation(fields: [orgId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
 
-  org  Org  @relation(fields: [orgId], references: [id])
-  user User @relation(fields: [userId], references: [id])
-
-  // used by server.js upsert(where: { orgId_userId: { ... } })
   @@unique([orgId, userId], name: "orgId_userId")
   @@index([orgId])
   @@index([userId])
 }
 
-// =======================
-// Password / Registration
-// =======================
-
 model PasswordToken {
   id        String    @id @default(cuid())
   userId    String
-  purpose   String      // 'register' | 'reset'
-  tokenHash String      @unique
+  purpose   String
+  tokenHash String    @unique
   expiresAt DateTime
   usedAt    DateTime?
-  createdAt DateTime    @default(now())
-
-  user User @relation(fields: [userId], references: [id])
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id])
 
   @@index([userId])
 }
 
-// =======================
-// Billing
-// =======================
-
 model Subscription {
-  id               String    @id                // we store "stripe_<subId>"
+  id               String    @id
   orgId            String
-  provider         String                         // "stripe"
+  provider         String
   status           String
   currentPeriodEnd DateTime?
   customerId       String?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
-
-  org Org @relation(fields: [orgId], references: [id])
+  org              Org       @relation(fields: [orgId], references: [id])
 
   @@index([orgId])
   @@index([provider])
 }
 
-// =======================
-// Premium Features - Server Side Validation
-// =======================
+model AuthorizedDevice {
+  id           String   @id
+  userId       String
+  deviceId     String
+  deviceName   String
+  appType      String
+  platform     String
+  lastSeenAt   DateTime @default(now())
+  registeredAt DateTime @default(now())
+  active       Boolean  @default(true)
+  User         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-model NotificationSettings {
-  id          String   @id @default(cuid())
-  userId      String   @unique
-  soundEnabled Boolean @default(false)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  @@unique([userId, deviceId, appType])
+  @@index([deviceId])
+  @@index([userId, appType])
+  @@index([userId])
+}
 
-  user  User @relation(fields: [userId], references: [id], onDelete: Cascade)
-  rules NotificationRule[]
+model DeviceAuditLog {
+  id        String   @id
+  userId    String
+  deviceId  String
+  appType   String
+  action    String
+  reason    String?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([deviceId])
+  @@index([userId])
+}
+
+model DeviceResetToken {
+  id              String    @id
+  userId          String    @unique
+  tokensRemaining Int       @default(2)
+  lastResetAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime
+  User            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
 }
 
 model NotificationRule {
-  id        String   @id @default(cuid())
-  settingsId String
-  name      String
-  type      String   @default("contains") // "contains" or "regex"
-  pattern   String
-  soundFile String   @default("default.wav")
-  enabled   Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  settings NotificationSettings @relation(fields: [settingsId], references: [id], onDelete: Cascade)
+  id                   String               @id
+  settingsId           String
+  name                 String
+  type                 String               @default("contains")
+  pattern              String
+  soundFile            String               @default("default.wav")
+  enabled              Boolean              @default(true)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @default(now())
+  NotificationSettings NotificationSettings @relation(fields: [settingsId], references: [id], onDelete: Cascade)
 
   @@index([settingsId])
 }
 
+model NotificationSettings {
+  id               String             @id
+  userId           String             @unique
+  soundEnabled     Boolean            @default(false)
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @default(now())
+  NotificationRule NotificationRule[]
+  User             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
 model NotificationTrigger {
-  id          String   @id @default(cuid())
+  id          String   @id
   userId      String
   ruleName    String
   triggeredAt DateTime @default(now())
   lineLength  Int      @default(0)
+  User        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId])
   @@index([triggeredAt])
+  @@index([userId])
 }
