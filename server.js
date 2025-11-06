@@ -1857,7 +1857,8 @@ app.post('/admin/users/grant_reset_tokens', adminAuth, async (req, res) => {
       create: {
         id: `drt_${user.id}_${Date.now()}`,  // ⭐ ADDED: Required ID field
         userId: user.id,
-        tokensRemaining: tokensToAdd
+        tokensRemaining: tokensToAdd,
+        updatedAt: new Date()  // ⭐ ADD THIS LINE
       },
       update: {
         tokensRemaining: { increment: tokensToAdd }
