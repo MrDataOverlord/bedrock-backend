@@ -120,7 +120,11 @@ model Org {
   name             String         @default("My Org")
   createdAt        DateTime       @default(now())
   stripeCustomerId String?        @unique
+<<<<<<< HEAD
   members          Member[]
+=======
+  members          Member[]       // ✅ Changed from "Member" to "members"
+>>>>>>> 51723f4a3a654be236acff0cc1e3b250421b7d28
   User             User           @relation(fields: [ownerUserId], references: [id])
   subscriptions    Subscription[]
 
