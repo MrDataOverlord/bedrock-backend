@@ -169,6 +169,6 @@ model User {
   Member               Member[]
   NotificationSettings NotificationSettings?
   NotificationTrigger  NotificationTrigger[]
-  Org                  Org[]
+  ownedOrgs            Org[]                 @relation("OrgOwner")
   PasswordToken        PasswordToken[]
 }
