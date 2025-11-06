@@ -7,7 +7,17 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+<<<<<<< HEAD
 model Device {
+=======
+// =======================
+// Core
+// =======================
+
+// Renamed from "Device" to avoid conflict with HWID Device model below
+// This appears to be for mobile push notifications
+model MobileDevice {
+>>>>>>> 6bc3f326cfebba82840c07126620c07d046a49ac
   id        String   @id @default(cuid())
   deviceId  String
   platform  String
@@ -17,6 +27,7 @@ model Device {
 }
 
 model User {
+<<<<<<< HEAD
   id                   String                @id @default(cuid())
   email                String                @unique
   passwordHash         String?
@@ -32,6 +43,28 @@ model User {
   NotificationTrigger  NotificationTrigger[]
   ownedOrgs            Org[]
   passwordTokens       PasswordToken[]
+=======
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String?
+  totpSecret    String?
+  isAdmin       Boolean  @default(false) 
+  createdAt     DateTime @default(now())
+  
+  // HWID Device Management System
+  maxWindowsDevices      Int       @default(1)
+  maxLinuxDevices        Int       @default(1)
+  devices           AuthorizedDevice[]
+  deviceResetTokens DeviceResetToken?
+
+  ownedOrgs      Org[]
+  memberships    Member[]
+  passwordTokens PasswordToken[]
+  
+  // Premium notification relations
+  notificationSettings NotificationSettings?
+  notificationTriggers NotificationTrigger[]
+>>>>>>> 6bc3f326cfebba82840c07126620c07d046a49ac
 }
 
 model Org {
@@ -74,6 +107,69 @@ model PasswordToken {
   @@index([userId])
 }
 
+<<<<<<< HEAD
+=======
+// ============================================================================
+// Device Management System - HWID-based Authorization
+// ============================================================================
+
+// HWID Device tracking for premium feature authorization
+// Renamed from "Device" to "AuthorizedDevice" to avoid conflict
+model AuthorizedDevice {
+  id           String   @id @default(cuid())
+  userId       String
+  deviceId     String   // HWID hash
+  deviceName   String   // User-friendly name
+  appType      String   // "commander" | "server-manager"
+  platform     String   // "Windows" | "Linux"
+  lastSeenAt   DateTime @default(now())
+  registeredAt DateTime @default(now())
+  active       Boolean  @default(true)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId, appType]) // One HWID per app type per user
+  @@index([userId])
+  @@index([deviceId])
+  @@index([userId, appType])
+}
+
+// Device reset token system (1 per month)
+model DeviceResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  tokensRemaining Int   @default(2) // Start with 2 tokens
+  lastResetAt     DateTime? // When they last used a reset token
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId])
+  @@index([userId])
+}
+
+// Audit log for device changes
+model DeviceAuditLog {
+  id        String   @id @default(cuid())
+  userId    String
+  deviceId  String
+  appType   String
+  action    String   // "registered" | "unregistered" | "reset" | "rejected"
+  reason    String?  // Additional context
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([deviceId])
+  @@index([createdAt])
+}
+
+// =======================
+// Billing
+// =======================
+
+>>>>>>> 6bc3f326cfebba82840c07126620c07d046a49ac
 model Subscription {
   id               String    @id
   orgId            String

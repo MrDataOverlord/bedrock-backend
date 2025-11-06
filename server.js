@@ -79,16 +79,30 @@ const log = (...a) => console.log(...a);
 const isEmail = (s) => typeof s === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
 
 const signAccess = (user) =>
-  jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, { expiresIn: '12h' });
+  jwt.sign({ sub: user.id, email: user.email, type: 'access' }, JWT_SECRET, { expiresIn: '1h' });
+
+const signRefresh = (user) =>
+  jwt.sign({ sub: user.id, email: user.email, type: 'refresh' }, JWT_SECRET, { expiresIn: '30d' });
 
 function auth(req, res, next) {
   try {
     const h = req.headers.authorization || '';
     const [, token] = h.split(' ');
     if (!token) return res.status(401).json({ error: 'Missing bearer token' });
-    req.user = jwt.verify(token, JWT_SECRET);
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Ensure this is an access token, not a refresh token
+    if (decoded.type !== 'access') {
+      return res.status(401).json({ error: 'Invalid token type' });
+    }
+    
+    req.user = decoded;
     next();
-  } catch {
+  } catch (err) {
+    if (err.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Token expired', code: 'TOKEN_EXPIRED' });
+    }
     res.status(401).json({ error: 'Invalid token' });
   }
 }
@@ -227,6 +241,18 @@ async function sendRegistrationEmail(email, rawToken) {
   log('[mail] sent:', email, 'messageId:', info.messageId);
 }
 
+// ---------- password policy ----------
+function validatePasswordPolicy(pw) {
+  const issues = [];
+  const s = String(pw || '');
+  if (s.length < 8) issues.push('at least 8 characters');
+  if (/\s/.test(s)) issues.push('no spaces');
+  if (!(/[0-9]/.test(s) || /[~`!@#$%^&*()\-\_=+\[\]{}|\\;:'",.<>/?]/.test(s))) {
+    issues.push('include a number or a symbol');
+  }
+  return { ok: issues.length === 0, issues };
+}
+
 // ---------- Stripe raw-body ----------
 app.use(express.json({
   verify: (req, _res, buf) => {
@@ -321,22 +347,81 @@ app.post('/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'Missing fields' });
+    
     const user = await prisma.user.findUnique({ where: { email: email.toLowerCase().trim() } });
     if (!user || !user.passwordHash) return res.status(401).json({ error: 'Invalid credentials' });
+    
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    res.json({ access: signAccess(user) });
+    
+    // Return both access and refresh tokens
+    res.json({ 
+      access: signAccess(user),
+      refresh: signRefresh(user)
+    });
   } catch (e) {
     console.error('[login] error:', e?.message || e);
     res.status(500).json({ error: 'Login failed' });
   }
 });
 
+// ---------- REFRESH ENDPOINT ----------
+app.post('/auth/refresh', async (req, res) => {
+  try {
+    const { refresh } = req.body || {};
+    if (!refresh) {
+      return res.status(400).json({ error: 'Missing refresh token' });
+    }
+
+    // Verify the refresh token
+    let decoded;
+    try {
+      decoded = jwt.verify(refresh, JWT_SECRET);
+    } catch (err) {
+      if (err.name === 'TokenExpiredError') {
+        return res.status(401).json({ error: 'Refresh token expired', code: 'REFRESH_EXPIRED' });
+      }
+      return res.status(401).json({ error: 'Invalid refresh token' });
+    }
+
+    // Ensure this is a refresh token, not an access token
+    if (decoded.type !== 'refresh') {
+      return res.status(401).json({ error: 'Invalid token type' });
+    }
+
+    // Verify user still exists
+    const user = await prisma.user.findUnique({ where: { id: decoded.sub } });
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    // Issue new access token (and optionally a new refresh token)
+    res.json({ 
+      access: signAccess(user),
+      refresh: signRefresh(user) // Issue new refresh token for extended sessions
+    });
+    
+    log(`[refresh] issued new tokens for user ${user.email}`);
+  } catch (e) {
+    console.error('[refresh] error:', e?.message || e);
+    res.status(500).json({ error: 'Token refresh failed' });
+  }
+});
+
 // ----- Registration completion (FIXED token validation) -----
 app.post('/auth/register/complete', async (req, res) => {
   try {
-    const { token, password } = req.body || {};
+    const { token, password, confirm } = req.body || {};
     if (!token || !password) return res.status(400).json({ error: 'Missing fields' });
+
+    // Policy enforcement
+    const v = validatePasswordPolicy(password);
+    if (!v.ok) return res.status(400).json({ error: `Password requirements: ${v.issues.join(', ')}` });
+
+    // Optional confirm check (harmless if client doesn’t send it)
+    if (typeof confirm === 'string' && confirm !== password) {
+      return res.status(400).json({ error: 'Passwords do not match' });
+    }
 
     // Get all unused registration tokens and find the matching one
     const tokens = await prisma.passwordToken.findMany({
@@ -456,8 +541,16 @@ app.post('/auth/reset/start', async (req, res) => {
 // ----- Forgot password (complete) -----
 app.post('/auth/reset/complete', async (req, res) => {
   try {
-    const { token, newPassword } = req.body || {};
+    const { token, newPassword, confirmPassword } = req.body || {};
     if (!token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
+
+    // Policy enforcement
+    const v = validatePasswordPolicy(newPassword);
+    if (!v.ok) return res.status(400).json({ error: `Password requirements: ${v.issues.join(', ')}` });
+
+    if (typeof confirmPassword === 'string' && confirmPassword !== newPassword) {
+      return res.status(400).json({ error: 'Passwords do not match' });
+    }
 
     // Get all unused reset tokens and find the matching one
     const tokens = await prisma.passwordToken.findMany({
@@ -873,26 +966,40 @@ app.post('/billing/checkout_renew', auth, async (req, res) => {
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user?.email) return res.status(400).json({ error: 'missing_email' });
 
+    console.log('[checkout_renew] Processing renewal for:', user.email);
+
     // Get verified customer id if exists
     const verifiedCustomerId = await getValidCustomerIdForUser(userId, user.email);
 
-    const session = await stripe.checkout.sessions.create({
+    // Create checkout session
+    const sessionConfig = {
       mode: 'subscription',
       line_items: [{ price: STRIPE_PRICE_PREMIUM, quantity: 1 }],
-      ...(verifiedCustomerId
-        ? { customer: verifiedCustomerId }
-        : { customer_creation: 'always', customer_email: user.email }),
       success_url: 'https://www.nerdherdmc.net/accounts?renew=success&session_id={CHECKOUT_SESSION_ID}',
       cancel_url: 'https://www.nerdherdmc.net/accounts?renew=cancel',
       allow_promotion_codes: true,
-    });
+    };
 
-    console.log('[checkout_renew] Created checkout session for', user.email);
+    // Add customer info - use existing customer OR just customer_email (NOT customer_creation)
+    if (verifiedCustomerId) {
+      sessionConfig.customer = verifiedCustomerId;
+      console.log('[checkout_renew] Using existing customer:', verifiedCustomerId);
+    } else {
+      sessionConfig.customer_email = user.email;
+      console.log('[checkout_renew] Creating new customer for:', user.email);
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionConfig);
+
+    console.log('[checkout_renew] Checkout session created:', session.id);
     return res.json({ url: session.url });
     
   } catch (e) {
     console.error('[checkout_renew] error:', e?.message || e);
-    return res.status(500).json({ error: 'Checkout failed', detail: e?.message });
+    return res.status(500).json({ 
+      error: 'Checkout failed', 
+      detail: e?.message 
+    });
   }
 });
 
@@ -913,6 +1020,922 @@ app.get('/billing/price_check', async (_req, res) => {
     res.status(500).json({ error: e?.message || 'price check failed' });
   }
 });
+
+// ============================================================================
+// Device Management Endpoints
+// ============================================================================
+
+
+// ---------- Device Management Helper Functions ----------
+
+async function generateDeviceResetTokens(userId) {
+  // Create or get existing reset tokens
+  const tokens = await prisma.deviceResetToken.upsert({
+    where: { userId },
+    create: { userId, tokensRemaining: 2 },
+    update: {} // Don't modify if exists
+  });
+  return tokens;
+}
+
+async function canResetDevice(userId) {
+  const tokens = await prisma.deviceResetToken.findUnique({
+    where: { userId }
+  });
+  
+  if (!tokens) return { canReset: true, tokensRemaining: 2 }; // New user
+  
+  // Check if they have tokens remaining
+  if (tokens.tokensRemaining > 0) {
+    return { canReset: true, tokensRemaining: tokens.tokensRemaining };
+  }
+  
+  // Check if 30 days have passed since last reset
+  if (tokens.lastResetAt) {
+    const daysSinceReset = (Date.now() - tokens.lastResetAt.getTime()) / (1000 * 60 * 60 * 24);
+    if (daysSinceReset >= 30) {
+      // Grant new token
+      await prisma.deviceResetToken.update({
+        where: { userId },
+        data: { tokensRemaining: 1, lastResetAt: null }
+      });
+      return { canReset: true, tokensRemaining: 1 };
+    }
+    
+    const daysUntilReset = Math.ceil(30 - daysSinceReset);
+    return { 
+      canReset: false, 
+      tokensRemaining: 0,
+      daysUntilReset 
+    };
+  }
+  
+  return { canReset: false, tokensRemaining: 0 };
+}
+
+function getDeviceFingerprint(req) {
+  // Get IP address and user agent for audit
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || 
+             req.headers['x-real-ip'] || 
+             req.connection.remoteAddress;
+  return { ip };
+}
+
+// ============================================================================
+// DEVICE VERIFICATION HELPER FUNCTION
+// ============================================================================
+
+async function verifyPremiumDevice(req, res) {
+  const userId = req.user.userId;
+  const deviceId = req.body.deviceId || req.query.deviceId || req.headers['x-device-id'];
+  const appType = req.body.appType || req.query.appType || 'commander';
+
+  console.log(`[DEVICE_CHECK] Verifying device for user ${userId}, deviceId: ${deviceId}, appType: ${appType}`);
+
+  try {
+    // Check if user has premium
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        orgs: {
+          include: {
+            subscriptions: {
+              where: {
+                status: 'active',
+                currentPeriodEnd: { gt: new Date() }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    const hasPremium = user?.orgs?.some(org => org.subscriptions?.length > 0);
+    if (!hasPremium) {
+      console.log(`[DEVICE_CHECK] User ${userId} does not have premium`);
+      return { authorized: false, error: 'Premium subscription required' };
+    }
+
+    // If no device ID provided, allow (backward compatibility during transition)
+    if (!deviceId) {
+      console.log(`[DEVICE_CHECK] No device ID provided, allowing access (backward compatibility)`);
+      return { authorized: true };
+    }
+
+    // Check if device is authorized
+    const device = await prisma.authorizedDevice.findFirst({
+      where: {
+        userId,
+        deviceId,
+        appType,
+        active: true
+      }
+    });
+
+    if (!device) {
+      console.log(`[DEVICE_CHECK] Device not authorized for user ${userId}`);
+      return { authorized: false, error: 'Device not authorized. Please manage your devices in the Premium menu.' };
+    }
+
+    // Update last seen
+    await prisma.authorizedDevice.update({
+      where: { id: device.id },
+      data: { lastSeenAt: new Date() }
+    });
+
+    console.log(`[DEVICE_CHECK] Device ${device.deviceName} authorized for user ${userId}`);
+    return { authorized: true };
+  } catch (error) {
+    console.error('[DEVICE_CHECK] Error:', error);
+    return { authorized: false, error: 'Device verification failed' };
+  }
+}
+
+// ---------- Device Registration Endpoint ----------
+app.post('/devices/register', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { deviceId, deviceName, appType, platform } = req.body || {};
+    
+    // Validate inputs
+    if (!deviceId || !appType || !platform) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    if (!['commander', 'server-manager'].includes(appType)) {
+      return res.status(400).json({ error: 'Invalid appType' });
+    }
+    
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+    
+    // Check if this device is already registered
+    const existing = await prisma.authorizedDevice.findUnique({
+      where: { 
+        userId_deviceId_appType: { userId, deviceId, appType } 
+      }
+    });
+    
+    if (existing) {
+      // Update last seen
+      await prisma.authorizedDevice.update({
+        where: { id: existing.id },
+        data: { lastSeenAt: new Date(), active: true }
+      });
+      
+      return res.json({ 
+        ok: true, 
+        device: existing,
+        message: 'Device already registered' 
+      });
+    }
+    
+    // Check if another device is registered for this app type
+    // Platform-specific device limit check
+const isWindows = platform.toLowerCase().includes('windows');
+const isLinux = platform.toLowerCase().includes('linux');
+
+// Get user's device limits
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  select: { 
+    maxWindowsDevices: true, 
+    maxLinuxDevices: true 
+  }
+});
+
+const maxAllowed = isWindows 
+  ? (user?.maxWindowsDevices || 1)
+  : isLinux 
+    ? (user?.maxLinuxDevices || 1)
+    : 1; // Default for other platforms
+
+// Count active devices for this platform + appType
+const platformKey = isWindows ? 'windows' : isLinux ? 'linux' : platform.toLowerCase();
+
+const activeDeviceCount = await prisma.authorizedDevice.count({
+  where: {
+    userId,
+    appType,
+    active: true,
+    platform: {
+      contains: platformKey,
+      mode: 'insensitive'
+    },
+    id: { not: existing?.id }
+  }
+});
+
+console.log(`[device/register] User ${userId} has ${activeDeviceCount}/${maxAllowed} active ${platformKey} devices for ${appType}`);
+
+if (activeDeviceCount >= maxAllowed) {
+  // Find the existing devices to show user
+  const existingDevices = await prisma.authorizedDevice.findMany({
+    where: {
+      userId,
+      appType,
+      active: true,
+      platform: {
+        contains: platformKey,
+        mode: 'insensitive'
+      }
+    },
+    orderBy: { lastSeenAt: 'desc' },
+    take: 3
+  });
+
+  return res.status(409).json({ 
+    error: 'Device limit reached',
+    code: 'DEVICE_LIMIT_REACHED',
+    platform: platformKey,
+    currentCount: activeDeviceCount,
+    maxAllowed: maxAllowed,
+    existingDevices: existingDevices.map(d => ({
+      name: d.deviceName,
+      registeredAt: d.registeredAt,
+      lastSeenAt: d.lastSeenAt
+    })),
+    message: `Device limit reached for ${platformKey}. You have ${activeDeviceCount}/${maxAllowed} devices. Use a device reset token to switch devices.`
+  });
+}
+    
+    // Register new device
+    const device = await prisma.authorizedDevice.create({
+      data: {
+        userId,
+        deviceId,
+        deviceName: deviceName || `${platform} Device`,
+        appType,
+        platform,
+        active: true
+      }
+    });
+    
+    // Ensure user has reset tokens
+    await generateDeviceResetTokens(userId);
+    
+    // Audit log
+    const { ip } = getDeviceFingerprint(req);
+    await prisma.deviceAuditLog.create({
+      data: {
+        userId,
+        deviceId,
+        appType,
+        action: 'registered',
+        ipAddress: ip
+      }
+    });
+    
+    log(`[device] registered: user=${userId} device=${deviceId} app=${appType}`);
+    
+    res.json({ ok: true, device });
+  } catch (e) {
+    console.error('[devices/register] error:', e?.message || e);
+    res.status(500).json({ error: 'Device registration failed' });
+  }
+});
+
+// ---------- Device Verification Endpoint ----------
+app.post('/devices/verify', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { deviceId, appType } = req.body || {};
+    
+    if (!deviceId || !appType) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    // Check if device is registered and active
+    const device = await prisma.authorizedDevice.findUnique({
+      where: { 
+        userId_deviceId_appType: { userId, deviceId, appType } 
+      }
+    });
+    
+    if (!device || !device.active) {
+      return res.status(403).json({ 
+        error: 'Device not authorized',
+        code: 'DEVICE_NOT_AUTHORIZED',
+        registered: !!device
+      });
+    }
+    
+    // Update last seen
+    await prisma.authorizedDevice.update({
+      where: { id: device.id },
+      data: { lastSeenAt: new Date() }
+    });
+    
+    res.json({ ok: true, authorized: true });
+  } catch (e) {
+    console.error('[devices/verify] error:', e?.message || e);
+    res.status(500).json({ error: 'Device verification failed' });
+  }
+});
+
+// ---------- List User Devices ----------
+app.get('/devices', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    const devices = await prisma.authorizedDevice.findMany({
+      where: { userId },
+      orderBy: { lastSeenAt: 'desc' }
+    });
+    
+    // Get reset token info
+    const resetTokens = await prisma.deviceResetToken.findUnique({
+      where: { userId }
+    });
+    
+    const canReset = await canResetDevice(userId);
+    
+    res.json({ 
+      devices,
+      resetTokens: {
+        remaining: canReset.tokensRemaining,
+        canReset: canReset.canReset,
+        daysUntilReset: canReset.daysUntilReset || null,
+        lastResetAt: resetTokens?.lastResetAt || null
+      }
+    });
+  } catch (e) {
+    console.error('[devices] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to fetch devices' });
+  }
+});
+
+// ---------- Reset Device (Deactivate Current) ----------
+app.post('/devices/reset', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { appType } = req.body || {};
+    
+    if (!appType) {
+      return res.status(400).json({ error: 'Missing appType' });
+    }
+    
+    // Check if user can reset
+    const resetStatus = await canResetDevice(userId);
+    if (!resetStatus.canReset) {
+      return res.status(403).json({ 
+        error: 'No reset tokens available',
+        code: 'NO_RESET_TOKENS',
+        daysUntilReset: resetStatus.daysUntilReset
+      });
+    }
+    
+    // Deactivate all devices for this app type
+    const result = await prisma.authorizedDevice.updateMany({
+      where: { userId, appType, active: true },
+      data: { active: false }
+    });
+    
+    // Consume reset token
+    await prisma.deviceResetToken.update({
+      where: { userId },
+      data: { 
+        tokensRemaining: { decrement: 1 },
+        lastResetAt: new Date()
+      }
+    });
+    
+    // Audit log
+    const { ip } = getDeviceFingerprint(req);
+    await prisma.deviceAuditLog.create({
+      data: {
+        userId,
+        deviceId: 'ALL',
+        appType,
+        action: 'reset',
+        reason: `Used reset token. ${resetStatus.tokensRemaining - 1} remaining.`,
+        ipAddress: ip
+      }
+    });
+    
+    log(`[device] reset: user=${userId} app=${appType} devicesDeactivated=${result.count}`);
+    
+    res.json({ 
+      ok: true, 
+      devicesDeactivated: result.count,
+      tokensRemaining: resetStatus.tokensRemaining - 1
+    });
+  } catch (e) {
+    console.error('[devices/reset] error:', e?.message || e);
+    res.status(500).json({ error: 'Device reset failed' });
+  }
+});
+
+// ---------- Remove Specific Device ----------
+app.delete('/devices/:deviceId', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { deviceId } = req.params;
+    const { appType } = req.body || {};
+    
+    if (!appType) {
+      return res.status(400).json({ error: 'Missing appType' });
+    }
+    
+    // Check if user can reset
+    const resetStatus = await canResetDevice(userId);
+    if (!resetStatus.canReset) {
+      return res.status(403).json({ 
+        error: 'No reset tokens available',
+        code: 'NO_RESET_TOKENS',
+        daysUntilReset: resetStatus.daysUntilReset
+      });
+    }
+    
+    // Find and deactivate the device
+    const device = await prisma.authorizedDevice.findUnique({
+      where: { 
+        userId_deviceId_appType: { userId, deviceId, appType } 
+      }
+    });
+    
+    if (!device) {
+      return res.status(404).json({ error: 'Device not found' });
+    }
+    
+    await prisma.authorizedDevice.update({
+      where: { id: device.id },
+      data: { active: false }
+    });
+    
+    // Consume reset token
+    await prisma.deviceResetToken.update({
+      where: { userId },
+      data: { 
+        tokensRemaining: { decrement: 1 },
+        lastResetAt: new Date()
+      }
+    });
+    
+    // Audit log
+    const { ip } = getDeviceFingerprint(req);
+    await prisma.deviceAuditLog.create({
+      data: {
+        userId,
+        deviceId,
+        appType,
+        action: 'unregistered',
+        reason: 'User removed device',
+        ipAddress: ip
+      }
+    });
+    
+    log(`[device] removed: user=${userId} device=${deviceId} app=${appType}`);
+    
+    res.json({ 
+      ok: true,
+      tokensRemaining: resetStatus.tokensRemaining - 1
+    });
+  } catch (e) {
+    console.error('[devices/remove] error:', e?.message || e);
+    res.status(500).json({ error: 'Device removal failed' });
+  }
+});
+
+// ---------- Device Audit Log (Admin) ----------
+app.get('/devices/audit', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    
+    // Optional: check if user is admin
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user?.isAdmin) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    const { userId: targetUserId } = req.query;
+    
+    const logs = await prisma.deviceAuditLog.findMany({
+      where: targetUserId ? { userId: targetUserId } : {},
+      orderBy: { createdAt: 'desc' },
+      take: 100
+    });
+    
+    res.json({ logs });
+  } catch (e) {
+    console.error('[devices/audit] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
+});
+
+// ========== ADMIN ENDPOINTS ==========
+
+// Admin authorization middleware
+function adminAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    const [, token] = h.split(' ');
+    if (!token) return res.status(401).json({ error: 'Missing bearer token' });
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    
+    // Check if user is admin
+    prisma.user.findUnique({ 
+      where: { id: decoded.sub },
+      select: { isAdmin: true }
+    }).then(user => {
+      if (!user?.isAdmin) {
+        return res.status(403).json({ error: 'Admin access required' });
+      }
+      next();
+    }).catch(err => {
+      res.status(401).json({ error: 'Invalid token' });
+    });
+    
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// Manually grant premium to any user (ADMIN ONLY)
+app.post('/admin/grant_premium', adminAuth, async (req, res) => {
+  try {
+    const { email, days = 30 } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    console.log('[admin/grant_premium] Granting premium to:', email, 'for', days, 'days');
+
+    const user = await prisma.user.findUnique({ where: { email: email.toLowerCase().trim() } });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Find or create an org for this user
+    let org = await prisma.org.findFirst({
+      where: { ownerUserId: user.id }
+    });
+
+    if (!org) {
+      org = await prisma.org.create({
+        data: { 
+          name: `${email.split('@')[0]}'s Org`,
+          ownerUserId: user.id
+        }
+      });
+
+      await prisma.member.create({
+        data: { orgId: org.id, userId: user.id, role: 'owner' }
+      });
+    }
+
+    // Create a manual subscription (no Stripe)
+    const periodEnd = new Date();
+    periodEnd.setDate(periodEnd.getDate() + parseInt(days));
+
+    const manualSubId = `manual_${user.id}_${Date.now()}`;
+    
+    // Delete any existing manual subscriptions for this user
+    await prisma.subscription.deleteMany({
+      where: {
+        orgId: org.id,
+        provider: 'manual'
+      }
+    });
+
+    // Create new manual subscription
+    await prisma.subscription.create({
+      data: {
+        id: manualSubId,
+        orgId: org.id,
+        provider: 'manual',
+        status: 'active',
+        currentPeriodEnd: periodEnd,
+        customerId: 'manual'
+      }
+    });
+
+    console.log('[admin/grant_premium] Premium granted to', email, 'until:', periodEnd);
+
+    res.json({
+      ok: true,
+      message: `Premium access granted to ${email} for ${days} days`,
+      email: email,
+      expiresAt: periodEnd.toISOString()
+    });
+
+  } catch (e) {
+    console.error('[admin/grant_premium] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to grant premium', 
+      detail: e?.message 
+    });
+  }
+});
+
+// Manually create account and send registration email (ADMIN ONLY)
+app.post('/admin/create_account', adminAuth, async (req, res) => {
+  try {
+    const { email, grantPremiumDays } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    const cleanEmail = email.toLowerCase().trim();
+    console.log('[admin/create_account] Creating account for:', cleanEmail);
+
+    // Check if user already exists
+    let user = await prisma.user.findUnique({ where: { email: cleanEmail } });
+    
+    if (user) {
+      if (user.passwordHash) {
+        return res.status(400).json({ 
+          error: 'Account already exists with password set',
+          note: 'User can login directly'
+        });
+      }
+      console.log('[admin/create_account] User exists but no password, resending registration');
+    } else {
+      // Create new user
+      user = await prisma.user.create({ 
+        data: { email: cleanEmail }
+      });
+      console.log('[admin/create_account] Created new user:', user.id);
+    }
+
+    // Create and send registration token
+    const raw = await issueRegistrationToken(user.id);
+    await sendRegistrationEmail(cleanEmail, raw);
+    console.log('[admin/create_account] Registration email sent to:', cleanEmail);
+
+    // Optionally grant premium if days specified
+    let premiumInfo = null;
+    if (grantPremiumDays && grantPremiumDays > 0) {
+      let org = await prisma.org.findFirst({
+        where: { ownerUserId: user.id }
+      });
+
+      if (!org) {
+        org = await prisma.org.create({
+          data: { 
+            name: `${cleanEmail.split('@')[0]}'s Org`,
+            ownerUserId: user.id
+          }
+        });
+
+        await prisma.member.create({
+          data: { orgId: org.id, userId: user.id, role: 'owner' }
+        });
+      }
+
+      const periodEnd = new Date();
+      periodEnd.setDate(periodEnd.getDate() + parseInt(grantPremiumDays));
+
+      const manualSubId = `manual_${user.id}_${Date.now()}`;
+      
+      await prisma.subscription.deleteMany({
+        where: { orgId: org.id, provider: 'manual' }
+      });
+
+      await prisma.subscription.create({
+        data: {
+          id: manualSubId,
+          orgId: org.id,
+          provider: 'manual',
+          status: 'active',
+          currentPeriodEnd: periodEnd,
+          customerId: 'manual'
+        }
+      });
+
+      premiumInfo = {
+        granted: true,
+        days: grantPremiumDays,
+        expiresAt: periodEnd.toISOString()
+      };
+
+      console.log('[admin/create_account] Premium granted for', grantPremiumDays, 'days');
+    }
+
+    res.json({
+      ok: true,
+      message: `Account created and registration email sent to ${cleanEmail}`,
+      email: cleanEmail,
+      userId: user.id,
+      premium: premiumInfo,
+      alreadyExisted: !!user.passwordHash
+    });
+
+  } catch (e) {
+    console.error('[admin/create_account] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to create account', 
+      detail: e?.message 
+    });
+  }
+});
+
+// List all users (ADMIN ONLY)
+app.get('/admin/users', adminAuth, async (req, res) => {
+  try {
+    const users = await prisma.user.findMany({
+      select: {
+        id: true,
+        email: true,
+        isAdmin: true,
+        createdAt: true,
+        ownedOrgs: {
+          include: {
+            subscriptions: {
+              orderBy: { updatedAt: 'desc' },
+              take: 1
+            }
+          }
+        }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const usersWithStatus = users.map(u => {
+      const org = u.ownedOrgs?.[0];
+      const sub = org?.subscriptions?.[0];
+      const premium = sub && isPremium(sub.status, sub.currentPeriodEnd);
+
+      return {
+        id: u.id,
+        email: u.email,
+        isAdmin: u.isAdmin,
+        createdAt: u.createdAt,
+        premium: premium,
+        subscriptionStatus: sub?.status || 'none',
+        subscriptionEnd: sub?.currentPeriodEnd || null
+      };
+    });
+
+    res.json({ users: usersWithStatus });
+  } catch (e) {
+    console.error('[admin/users] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to list users' });
+  }
+});
+
+// ============================================================================
+// ADMIN DEVICE MANAGEMENT ENDPOINTS
+// ============================================================================
+
+// Set user's max devices per platform
+app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
+  try {
+    const { email, maxWindows, maxLinux } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    console.log('[admin/set_device_limits] Setting limits for:', email, 
+                'Windows:', maxWindows, 'Linux:', maxLinux);
+
+    const user = await prisma.user.findUnique({ 
+      where: { email: email.toLowerCase().trim() } 
+    });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const updateData = {};
+    if (maxWindows !== undefined && maxWindows !== null) {
+      updateData.maxWindowsDevices = parseInt(maxWindows);
+    }
+    if (maxLinux !== undefined && maxLinux !== null) {
+      updateData.maxLinuxDevices = parseInt(maxLinux);
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: updateData
+    });
+
+    console.log('[admin/set_device_limits] Updated device limits for', email);
+
+    res.json({
+      ok: true,
+      message: `Device limits updated for ${email}`,
+      maxWindows: updateData.maxWindowsDevices,
+      maxLinux: updateData.maxLinuxDevices
+    });
+
+  } catch (e) {
+    console.error('[admin/set_device_limits] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to set device limits', 
+      detail: e?.message 
+    });
+  }
+});
+
+// Grant reset tokens to a user
+app.post('/admin/users/grant_reset_tokens', adminAuth, async (req, res) => {
+  try {
+    const { email, tokens } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    const tokensToAdd = parseInt(tokens) || 1;
+    if (tokensToAdd < 1 || tokensToAdd > 10) {
+      return res.status(400).json({ error: 'Tokens must be between 1 and 10' });
+    }
+
+    console.log('[admin/grant_reset_tokens] Granting', tokensToAdd, 'tokens to:', email);
+
+    const user = await prisma.user.findUnique({ 
+      where: { email: email.toLowerCase().trim() } 
+    });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Upsert reset tokens
+    await prisma.deviceResetToken.upsert({
+      where: { userId: user.id },
+      create: {
+        userId: user.id,
+        tokensRemaining: tokensToAdd,
+        appType: 'commander'
+      },
+      update: {
+        tokensRemaining: { increment: tokensToAdd }
+      }
+    });
+
+    // Get updated count
+    const updated = await prisma.deviceResetToken.findUnique({
+      where: { userId: user.id }
+    });
+
+    console.log('[admin/grant_reset_tokens] User now has', updated?.tokensRemaining, 'tokens');
+
+    res.json({
+      ok: true,
+      message: `Granted ${tokensToAdd} reset token(s) to ${email}`,
+      totalTokens: updated?.tokensRemaining || 0
+    });
+
+  } catch (e) {
+    console.error('[admin/grant_reset_tokens] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to grant reset tokens', 
+      detail: e?.message 
+    });
+  }
+});
+
+// Get user's device status (for admin panel)
+app.get('/admin/users/:email/devices', adminAuth, async (req, res) => {
+  try {
+    const { email } = req.params;
+    
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase().trim() },
+      include: {
+        authorizedDevices: {
+          where: { active: true },
+          orderBy: { lastSeenAt: 'desc' }
+        }
+      }
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const resetTokens = await prisma.deviceResetToken.findUnique({
+      where: { userId: user.id }
+    });
+
+    res.json({
+      email: user.email,
+      maxWindowsDevices: user.maxWindowsDevices || 1,
+      maxLinuxDevices: user.maxLinuxDevices || 1,
+      activeDevices: user.authorizedDevices,
+      resetTokens: {
+        remaining: resetTokens?.tokensRemaining || 0,
+        lastUsed: resetTokens?.lastResetAt
+      }
+    });
+
+  } catch (e) {
+    console.error('[admin/users/devices] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to get user devices' });
+  }
+});
+
+// ========== END OF ADMIN ENDPOINTS ==========
 
 // Cancel subscription (keeps access until period end) - FIXED VERSION
 app.post('/billing/cancel_subscription', auth, async (req, res) => {
@@ -1396,11 +2419,57 @@ app.post('/webhooks/stripe', async (req, res) => {
 
 // ---------- Premium Features (Server-Side Validation) ----------
 
+// ============================================================================
+// DEVICE AUTHORIZATION HELPER
+// ============================================================================
+async function verifyDeviceAuthorization(userId, deviceId, appType = 'commander') {
+  if (!deviceId) {
+    // If no device ID provided, allow for backward compatibility
+    console.log('[verifyDeviceAuthorization] No device ID provided, allowing access');
+    return true;
+  }
+
+  try {
+    const device = await prisma.authorizedDevice.findFirst({
+      where: {
+        userId,
+        deviceId,
+        appType,
+        active: true
+      }
+    });
+
+    if (!device) {
+      console.log('[verifyDeviceAuthorization] Device not found or not active for user:', userId);
+      return false;
+    }
+
+    // Update last seen
+    await prisma.authorizedDevice.update({
+      where: { id: device.id },
+      data: { lastSeenAt: new Date() }
+    });
+
+    console.log('[verifyDeviceAuthorization] Device authorized:', device.deviceName);
+    return true;
+  } catch (error) {
+    console.error('[verifyDeviceAuthorization] error:', error);
+    return false;
+  }
+}
+
+// ============================================================================
+// NOTIFICATION ENDPOINTS
+// ============================================================================
+
 // Get user's notification settings
 app.get('/premium/notifications/settings', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
+    
     console.log('[DEBUG] Getting notification settings for user:', userId);
+    console.log('[DEBUG] Device ID:', deviceId);
     
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
@@ -1408,6 +2477,13 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
     
     if (!hasPremium) {
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[DEBUG] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     // Get or create default notification settings
@@ -1460,9 +2536,11 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
 app.post('/premium/notifications/rule', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
     const { name, type, pattern, soundFile, enabled } = req.body || {};
 
     console.log('[RULE_UPDATE] Update request for user:', userId);
+    console.log('[RULE_UPDATE] Device ID:', deviceId);
     console.log('[RULE_UPDATE] Request body:', { name, type, pattern, soundFile, enabled });
 
     // Validate required fields
@@ -1476,6 +2554,13 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
     if (!hasPremium) {
       console.log('[RULE_UPDATE] User does not have premium');
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[RULE_UPDATE] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     // Get user's notification settings
@@ -1549,17 +2634,27 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
   }
 });
 
-// Reset notification rules to defaults:
+// Reset notification rules to defaults
 app.post('/premium/notifications/reset', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
+    
     console.log('[DEBUG] Reset request for user:', userId);
+    console.log('[DEBUG] Device ID:', deviceId);
 
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
       console.log('[DEBUG] User does not have premium');
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[DEBUG] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     console.log('[DEBUG] Resetting notification rules to updated Bedrock patterns...');
@@ -1620,12 +2715,22 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
 app.post('/premium/notifications/sound', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
     const { enabled } = req.body || {};
+
+    console.log('[SOUND_TOGGLE] User:', userId, 'Device:', deviceId, 'Enabled:', enabled);
 
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[SOUND_TOGGLE] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     await prisma.notificationSettings.upsert({
@@ -1645,15 +2750,23 @@ app.post('/premium/notifications/sound', auth, async (req, res) => {
 app.get('/premium/sounds/:filename', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
     const { filename } = req.params;
 
-    console.log(`[premium/sounds] Request for sound: ${filename} by user: ${userId}`);
+    console.log(`[premium/sounds] Request for sound: ${filename} by user: ${userId}, device: ${deviceId}`);
 
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
       console.log(`[premium/sounds] User ${userId} does not have premium`);
       return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log(`[premium/sounds] Device not authorized`);
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
     // Validate filename for security
