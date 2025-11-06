@@ -1194,28 +1194,73 @@ app.post('/devices/register', auth, async (req, res) => {
     }
     
     // Check if another device is registered for this app type
-    const otherDevice = await prisma.authorizedDevice.findFirst({
-      where: { 
-        userId, 
-        appType,
-        active: true,
-        id: { not: existing?.id }
+    // Platform-specific device limit check
+const isWindows = platform.toLowerCase().includes('windows');
+const isLinux = platform.toLowerCase().includes('linux');
+
+// Get user's device limits
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  select: { 
+    maxWindowsDevices: true, 
+    maxLinuxDevices: true 
+  }
+});
+
+const maxAllowed = isWindows 
+  ? (user?.maxWindowsDevices || 1)
+  : isLinux 
+    ? (user?.maxLinuxDevices || 1)
+    : 1; // Default for other platforms
+
+// Count active devices for this platform + appType
+const platformKey = isWindows ? 'windows' : isLinux ? 'linux' : platform.toLowerCase();
+
+const activeDeviceCount = await prisma.authorizedDevice.count({
+  where: {
+    userId,
+    appType,
+    active: true,
+    platform: {
+      contains: platformKey,
+      mode: 'insensitive'
+    },
+    id: { not: existing?.id }
+  }
+});
+
+console.log(`[device/register] User ${userId} has ${activeDeviceCount}/${maxAllowed} active ${platformKey} devices for ${appType}`);
+
+if (activeDeviceCount >= maxAllowed) {
+  // Find the existing devices to show user
+  const existingDevices = await prisma.authorizedDevice.findMany({
+    where: {
+      userId,
+      appType,
+      active: true,
+      platform: {
+        contains: platformKey,
+        mode: 'insensitive'
       }
-    });
-    
-    if (otherDevice) {
-      // Another device exists - cannot register
-      return res.status(409).json({ 
-        error: 'Device limit reached',
-        code: 'DEVICE_LIMIT_REACHED',
-        existingDevice: {
-          name: otherDevice.deviceName,
-          registeredAt: otherDevice.registeredAt,
-          lastSeenAt: otherDevice.lastSeenAt
-        },
-        message: `Only one ${appType} device allowed. Use a device reset token to switch devices.`
-      });
-    }
+    },
+    orderBy: { lastSeenAt: 'desc' },
+    take: 3
+  });
+
+  return res.status(409).json({ 
+    error: 'Device limit reached',
+    code: 'DEVICE_LIMIT_REACHED',
+    platform: platformKey,
+    currentCount: activeDeviceCount,
+    maxAllowed: maxAllowed,
+    existingDevices: existingDevices.map(d => ({
+      name: d.deviceName,
+      registeredAt: d.registeredAt,
+      lastSeenAt: d.lastSeenAt
+    })),
+    message: `Device limit reached for ${platformKey}. You have ${activeDeviceCount}/${maxAllowed} devices. Use a device reset token to switch devices.`
+  });
+}
     
     // Register new device
     const device = await prisma.authorizedDevice.create({
@@ -1733,6 +1778,160 @@ app.get('/admin/users', adminAuth, async (req, res) => {
   } catch (e) {
     console.error('[admin/users] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to list users' });
+  }
+});
+
+// ============================================================================
+// ADMIN DEVICE MANAGEMENT ENDPOINTS
+// ============================================================================
+
+// Set user's max devices per platform
+app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
+  try {
+    const { email, maxWindows, maxLinux } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    console.log('[admin/set_device_limits] Setting limits for:', email, 
+                'Windows:', maxWindows, 'Linux:', maxLinux);
+
+    const user = await prisma.user.findUnique({ 
+      where: { email: email.toLowerCase().trim() } 
+    });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const updateData = {};
+    if (maxWindows !== undefined && maxWindows !== null) {
+      updateData.maxWindowsDevices = parseInt(maxWindows);
+    }
+    if (maxLinux !== undefined && maxLinux !== null) {
+      updateData.maxLinuxDevices = parseInt(maxLinux);
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: updateData
+    });
+
+    console.log('[admin/set_device_limits] Updated device limits for', email);
+
+    res.json({
+      ok: true,
+      message: `Device limits updated for ${email}`,
+      maxWindows: updateData.maxWindowsDevices,
+      maxLinux: updateData.maxLinuxDevices
+    });
+
+  } catch (e) {
+    console.error('[admin/set_device_limits] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to set device limits', 
+      detail: e?.message 
+    });
+  }
+});
+
+// Grant reset tokens to a user
+app.post('/admin/users/grant_reset_tokens', adminAuth, async (req, res) => {
+  try {
+    const { email, tokens } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    const tokensToAdd = parseInt(tokens) || 1;
+    if (tokensToAdd < 1 || tokensToAdd > 10) {
+      return res.status(400).json({ error: 'Tokens must be between 1 and 10' });
+    }
+
+    console.log('[admin/grant_reset_tokens] Granting', tokensToAdd, 'tokens to:', email);
+
+    const user = await prisma.user.findUnique({ 
+      where: { email: email.toLowerCase().trim() } 
+    });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Upsert reset tokens
+    await prisma.deviceResetToken.upsert({
+      where: { userId: user.id },
+      create: {
+        userId: user.id,
+        tokensRemaining: tokensToAdd,
+        appType: 'commander'
+      },
+      update: {
+        tokensRemaining: { increment: tokensToAdd }
+      }
+    });
+
+    // Get updated count
+    const updated = await prisma.deviceResetToken.findUnique({
+      where: { userId: user.id }
+    });
+
+    console.log('[admin/grant_reset_tokens] User now has', updated?.tokensRemaining, 'tokens');
+
+    res.json({
+      ok: true,
+      message: `Granted ${tokensToAdd} reset token(s) to ${email}`,
+      totalTokens: updated?.tokensRemaining || 0
+    });
+
+  } catch (e) {
+    console.error('[admin/grant_reset_tokens] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to grant reset tokens', 
+      detail: e?.message 
+    });
+  }
+});
+
+// Get user's device status (for admin panel)
+app.get('/admin/users/:email/devices', adminAuth, async (req, res) => {
+  try {
+    const { email } = req.params;
+    
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase().trim() },
+      include: {
+        authorizedDevices: {
+          where: { active: true },
+          orderBy: { lastSeenAt: 'desc' }
+        }
+      }
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const resetTokens = await prisma.deviceResetToken.findUnique({
+      where: { userId: user.id }
+    });
+
+    res.json({
+      email: user.email,
+      maxWindowsDevices: user.maxWindowsDevices || 1,
+      maxLinuxDevices: user.maxLinuxDevices || 1,
+      activeDevices: user.authorizedDevices,
+      resetTokens: {
+        remaining: resetTokens?.tokensRemaining || 0,
+        lastUsed: resetTokens?.lastResetAt
+      }
+    });
+
+  } catch (e) {
+    console.error('[admin/users/devices] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to get user devices' });
   }
 });
 
