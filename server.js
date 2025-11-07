@@ -2761,16 +2761,21 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
       
       const defaultRules = createDefaultNotificationRules();
       
-      settings = await prisma.notificationSettings.create({
-        data: {
-          userId,
-          soundEnabled: false,
-          rules: {
-            create: defaultRules
-          }
-        },
-        include: { rules: true }
-      });
+settings = await prisma.notificationSettings.create({
+  data: {
+    id: `ns_${userId}_${Date.now()}`,  // ⭐ ADD THIS
+    userId,
+    soundEnabled: false,
+    updatedAt: new Date(),  // ⭐ ADD THIS
+    rules: {
+      create: defaultRules.map(rule => ({
+        id: `nr_${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,  // ⭐ ADD IDs to rules too
+        ...rule
+      }))
+    }
+  },
+  include: { rules: true }
+});
     }
 
     const response = {
@@ -2950,15 +2955,20 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
       console.log('[DEBUG] Creating new settings with rules:', defaultRules.map(r => r.name));
 
       const newSettings = await tx.notificationSettings.create({
-        data: {
-          userId,
-          soundEnabled: false,
-          rules: {
-            create: defaultRules
-          }
-        },
-        include: { rules: true }
-      });
+      data: {
+      id: `ns_${userId}_${Date.now()}`,
+      userId,
+      soundEnabled: false,
+      updatedAt: new Date(),
+      rules: {
+      create: defaultRules.map((rule, index) => ({
+        id: `nr_${userId}_${Date.now()}_${index}`,
+        ...rule
+      }))
+    }
+  },
+  include: { rules: true }
+});
 
       console.log('[DEBUG] Created new settings with', newSettings.rules.length, 'rules');
     });
@@ -2995,11 +3005,20 @@ app.post('/premium/notifications/sound', auth, async (req, res) => {
       return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
     }
 
-    await prisma.notificationSettings.upsert({
-      where: { userId },
-      create: { userId, soundEnabled: Boolean(enabled) },
-      update: { soundEnabled: Boolean(enabled) }
-    });
+    // ✅ NEW:
+await prisma.notificationSettings.upsert({
+  where: { userId },
+  create: { 
+    id: `ns_${userId}_${Date.now()}`,  // ⭐ ADD THIS
+    userId, 
+    soundEnabled: Boolean(enabled),
+    updatedAt: new Date()  // ⭐ ADD THIS
+  },
+  update: { 
+    soundEnabled: Boolean(enabled),
+    updatedAt: new Date()  // ⭐ ADD THIS
+  }
+});
 
     res.json({ ok: true, enabled: Boolean(enabled) });
   } catch (e) {
