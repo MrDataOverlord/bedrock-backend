@@ -634,7 +634,7 @@ app.post('/premium/notifications/migrate-patterns', auth, async (req, res) => {
     let updatedCount = 0;
 
     for (const update of updates) {
-      const rule = settings.rules.find(r => 
+      const rule = settings.NotificationRule.find(r => 
         r.pattern === update.oldPattern || r.name === update.name
       );
       
@@ -653,7 +653,7 @@ app.post('/premium/notifications/migrate-patterns', auth, async (req, res) => {
     }
 
     // Add new Player Spawn rule if it doesn't exist
-    const spawnRule = settings.rules.find(r => r.name === 'Player Spawn');
+    const spawnRule = settings.NotificationRule.find(r => r.name === 'Player Spawn');
     if (!spawnRule) {
       await prisma.notificationRule.create({
         data: {
@@ -2750,9 +2750,9 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
 
     // Get or create default notification settings
     let settings = await prisma.notificationSettings.findUnique({
-  where: { userId },
-  include: { NotificationRule: true } 
-});
+      where: { userId },
+      include: { NotificationRule: true }  // ✅ Prisma field
+    });
 
     console.log('[DEBUG] Found existing settings:', !!settings);
 
@@ -2761,27 +2761,28 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
       
       const defaultRules = createDefaultNotificationRules();
       
-settings = await prisma.notificationSettings.create({
-  data: {
-    id: `ns_${userId}_${Date.now()}`,  // ⭐ ADD THIS
-    userId,
-    soundEnabled: false,
-    updatedAt: new Date(),  // ⭐ ADD THIS
-    NotificationRule: {
-      create: defaultRules.map(rule => ({
-        id: `nr_${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,  // ⭐ ADD IDs to rules too
-        ...rule
-      }))
-    }
-  },
-  include: { NotificationRule: true }
-});
+      settings = await prisma.notificationSettings.create({
+        data: {
+          id: `ns_${userId}`,  // ✅ Use simple ID
+          userId,
+          soundEnabled: false,
+          updatedAt: new Date(),
+          NotificationRule: {  // ✅ Prisma field
+            create: defaultRules.map((rule, index) => ({
+              id: `nr_${userId}_${Date.now()}_${index}`,
+              ...rule
+            }))
+          }
+        },
+        include: { NotificationRule: true }  // ✅ Prisma field
+      });
     }
 
+    // ✅ CRITICAL FIX: Keep "rules" in response, use NotificationRule for data access
     const response = {
       soundEnabled: settings.soundEnabled,
-      NotificationRule: {
-        rules: settings.rules.map(rule => ({
+      rules: {  // ✅ API response uses "rules"
+        rules: settings.NotificationRule.map(rule => ({  // ✅ Access via NotificationRule
           name: rule.name,
           type: rule.type,
           pattern: rule.pattern,
