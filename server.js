@@ -606,7 +606,7 @@ app.post('/premium/notifications/migrate-patterns', auth, async (req, res) => {
         data: {
           userId,
           soundEnabled: false,
-          rules: {
+          NotificationRule: {
             create: defaultRules
           }
         }
@@ -2767,7 +2767,7 @@ settings = await prisma.notificationSettings.create({
     userId,
     soundEnabled: false,
     updatedAt: new Date(),  // ⭐ ADD THIS
-    rules: {
+    NotificationRule: {
       create: defaultRules.map(rule => ({
         id: `nr_${userId}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,  // ⭐ ADD IDs to rules too
         ...rule
@@ -2780,7 +2780,7 @@ settings = await prisma.notificationSettings.create({
 
     const response = {
       soundEnabled: settings.soundEnabled,
-      rules: {
+      NotificationRule: {
         rules: settings.rules.map(rule => ({
           name: rule.name,
           type: rule.type,
@@ -2960,7 +2960,7 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
       userId,
       soundEnabled: false,
       updatedAt: new Date(),
-      rules: {
+      NotificationRule: {
       create: defaultRules.map((rule, index) => ({
         id: `nr_${userId}_${Date.now()}_${index}`,
         ...rule
