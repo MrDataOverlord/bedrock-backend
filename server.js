@@ -1297,7 +1297,20 @@ app.post('/devices/register', auth, async (req, res) => {
     
     log(`[device] registered: user=${userId} device=${deviceId} app=${appType}`);
     
-    res.json({ ok: true, device });
+    // Get user's device limits to return to client
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  select: { maxWindowsDevices: true, maxLinuxDevices: true }
+});
+
+res.json({ 
+  ok: true, 
+  device,
+  deviceLimits: {
+    maxWindows: user?.maxWindowsDevices || 1,
+    maxLinux: user?.maxLinuxDevices || 1
+  }
+});
   } catch (e) {
     console.error('[devices/register] error:', e?.message || e);
     res.status(500).json({ error: 'Device registration failed' });
@@ -1359,22 +1372,30 @@ app.get('/devices', auth, async (req, res) => {
     
     const canReset = await canResetDevice(userId);
     
-    res.json({ 
-      devices,
-      resetTokens: {
-        remaining: canReset.tokensRemaining,
-        canReset: canReset.canReset,
-        daysUntilReset: canReset.daysUntilReset || null,
-        lastResetAt: resetTokens?.lastResetAt || null
-      }
-    });
+    const user = await prisma.user.findUnique({
+  where: { userId },
+  select: { maxWindowsDevices: true, maxLinuxDevices: true }
+});
+
+res.json({ 
+  devices,
+  resetTokens: {
+    remaining: canReset.tokensRemaining,
+    canReset: canReset.canReset,
+    daysUntilReset: canReset.daysUntilReset || null,
+    lastResetAt: resetTokens?.lastResetAt || null
+  },
+  deviceLimits: {
+    maxWindows: user?.maxWindowsDevices || 1,
+    maxLinux: user?.maxLinuxDevices || 1
+  }
+});
   } catch (e) {
     console.error('[devices] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to fetch devices' });
   }
 });
 
-// ---------- Reset Device (Deactivate Current) ----------
 // ---------- Reset Device (Deactivate Current) ----------
 app.post('/devices/reset', auth, async (req, res) => {
   try {
@@ -1435,6 +1456,123 @@ app.post('/devices/reset', auth, async (req, res) => {
   } catch (e) {
     console.error('[devices/reset] error:', e?.message || e);
     res.status(500).json({ error: 'Device reset failed' });
+  }
+});
+
+// ---------- Replace Specific Device (Selective) ----------
+app.post('/devices/replace', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const { targetDeviceId, newDeviceId, newDeviceName, appType, platform } = req.body || {};
+    
+    // Validate inputs
+    if (!targetDeviceId || !newDeviceId || !appType || !platform) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    
+    console.log(`[device/replace] User ${userId} replacing ${targetDeviceId} with ${newDeviceId}`);
+    
+    // Check if user can reset
+    const resetStatus = await canResetDevice(userId);
+    if (!resetStatus.canReset) {
+      return res.status(403).json({ 
+        error: 'No reset tokens available',
+        code: 'NO_RESET_TOKENS',
+        daysUntilReset: resetStatus.daysUntilReset
+      });
+    }
+    
+    // Verify the target device exists and belongs to this user
+    const targetDevice = await prisma.authorizedDevice.findUnique({
+      where: { 
+        userId_deviceId_appType: { userId, deviceId: targetDeviceId, appType } 
+      }
+    });
+    
+    if (!targetDevice) {
+      return res.status(404).json({ error: 'Target device not found' });
+    }
+    
+    // Check if new device is already registered
+    const existingNew = await prisma.authorizedDevice.findUnique({
+      where: { 
+        userId_deviceId_appType: { userId, deviceId: newDeviceId, appType } 
+      }
+    });
+    
+    if (existingNew && existingNew.active) {
+      return res.status(400).json({ error: 'New device is already authorized' });
+    }
+    
+    // Perform replacement in transaction
+    await prisma.$transaction(async (tx) => {
+      // 1. Deactivate target device
+      await tx.authorizedDevice.update({
+        where: { id: targetDevice.id },
+        data: { active: false }
+      });
+      
+      // 2. Register or reactivate new device
+      if (existingNew) {
+        // Reactivate existing registration
+        await tx.authorizedDevice.update({
+          where: { id: existingNew.id },
+          data: { 
+            active: true,
+            deviceName: newDeviceName || existingNew.deviceName,
+            lastSeenAt: new Date()
+          }
+        });
+      } else {
+        // Create new registration
+        await tx.authorizedDevice.create({
+          data: {
+            id: `dev_${userId}_${Date.now()}`,
+            userId,
+            deviceId: newDeviceId,
+            deviceName: newDeviceName || `${platform} Device`,
+            appType,
+            platform,
+            active: true
+          }
+        });
+      }
+      
+      // 3. Consume reset token
+      await tx.deviceResetToken.update({
+        where: { userId },
+        data: { 
+          tokensRemaining: { decrement: 1 },
+          lastResetAt: new Date(),
+          updatedAt: new Date()
+        }
+      });
+      
+      // 4. Audit log
+      const { ip } = getDeviceFingerprint(req);
+      await tx.deviceAuditLog.create({
+        data: {
+          id: `dal_${userId}_${Date.now()}`,
+          userId,
+          deviceId: newDeviceId,
+          appType,
+          action: 'replaced',
+          reason: `Replaced ${targetDevice.deviceName} with new device`,
+          ipAddress: ip
+        }
+      });
+    });
+    
+    log(`[device] replaced: user=${userId} old=${targetDeviceId} new=${newDeviceId} app=${appType}`);
+    
+    res.json({ 
+      ok: true,
+      message: 'Device replaced successfully',
+      tokensRemaining: resetStatus.tokensRemaining - 1
+    });
+  } catch (e) {
+    console.error('[devices/replace] error:', e?.message || e);
+    res.status(500).json({ error: 'Device replacement failed', detail: e?.message });
   }
 });
 
@@ -1828,6 +1966,95 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
     });
 
     console.log('[admin/set_device_limits] Updated device limits for', email);
+
+    // ⭐ AUTO-DEAUTH LOGIC STARTS HERE ⭐
+    // Auto-deauth oldest devices if admin lowered the limit
+    if (updateData.maxWindowsDevices !== undefined || updateData.maxLinuxDevices !== undefined) {
+      console.log('[admin/set_device_limits] Checking for devices to auto-deauth...');
+      
+      // Check Windows devices
+      if (updateData.maxWindowsDevices !== undefined) {
+        const newWindowsLimit = updateData.maxWindowsDevices;
+        const activeWindowsDevices = await prisma.authorizedDevice.findMany({
+          where: {
+            userId: user.id,
+            active: true,
+            platform: { contains: 'windows', mode: 'insensitive' }
+          },
+          orderBy: { lastSeenAt: 'asc' } // Oldest first
+        });
+        
+        const toDeauth = activeWindowsDevices.length - newWindowsLimit;
+        if (toDeauth > 0) {
+          console.log(`[admin/set_device_limits] Deauthing ${toDeauth} oldest Windows devices`);
+          const devicesToDeauth = activeWindowsDevices.slice(0, toDeauth);
+          
+          await prisma.authorizedDevice.updateMany({
+            where: {
+              id: { in: devicesToDeauth.map(d => d.id) }
+            },
+            data: { active: false }
+          });
+          
+          // Audit log
+          for (const device of devicesToDeauth) {
+            await prisma.deviceAuditLog.create({
+              data: {
+                id: `dal_${user.id}_${Date.now()}_${device.id}`,
+                userId: user.id,
+                deviceId: device.deviceId,
+                appType: device.appType,
+                action: 'auto_deauth',
+                reason: `Admin lowered Windows device limit to ${newWindowsLimit}`,
+                ipAddress: null
+              }
+            });
+          }
+        }
+      }
+      
+      // Check Linux devices
+      if (updateData.maxLinuxDevices !== undefined) {
+        const newLinuxLimit = updateData.maxLinuxDevices;
+        const activeLinuxDevices = await prisma.authorizedDevice.findMany({
+          where: {
+            userId: user.id,
+            active: true,
+            platform: { contains: 'linux', mode: 'insensitive' }
+          },
+          orderBy: { lastSeenAt: 'asc' } // Oldest first
+        });
+        
+        const toDeauth = activeLinuxDevices.length - newLinuxLimit;
+        if (toDeauth > 0) {
+          console.log(`[admin/set_device_limits] Deauthing ${toDeauth} oldest Linux devices`);
+          const devicesToDeauth = activeLinuxDevices.slice(0, toDeauth);
+          
+          await prisma.authorizedDevice.updateMany({
+            where: {
+              id: { in: devicesToDeauth.map(d => d.id) }
+            },
+            data: { active: false }
+          });
+          
+          // Audit log
+          for (const device of devicesToDeauth) {
+            await prisma.deviceAuditLog.create({
+              data: {
+                id: `dal_${user.id}_${Date.now()}_${device.id}`,
+                userId: user.id,
+                deviceId: device.deviceId,
+                appType: device.appType,
+                action: 'auto_deauth',
+                reason: `Admin lowered Linux device limit to ${newLinuxLimit}`,
+                ipAddress: null
+              }
+            });
+          }
+        }
+      }
+    }
+    // ⭐ AUTO-DEAUTH LOGIC ENDS HERE ⭐
 
     res.json({
       ok: true,
@@ -2852,6 +3079,37 @@ app.get('/premium/sounds/:filename', auth, async (req, res) => {
     }
   }
 });
+
+// ---------- Scheduled Jobs ----------
+
+// Clean up inactive devices (30+ days)
+async function cleanupInactiveDevices() {
+  try {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    const result = await prisma.authorizedDevice.deleteMany({
+      where: {
+        active: false,
+        lastSeenAt: {
+          lt: thirtyDaysAgo
+        }
+      }
+    });
+    
+    if (result.count > 0) {
+      console.log(`[cleanup] Removed ${result.count} inactive devices older than 30 days`);
+    }
+  } catch (e) {
+    console.error('[cleanup] Failed to clean inactive devices:', e?.message || e);
+  }
+}
+
+// Run cleanup daily at 3 AM
+const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+setInterval(cleanupInactiveDevices, CLEANUP_INTERVAL);
+// Also run once on startup (after 5 minutes)
+setTimeout(cleanupInactiveDevices, 5 * 60 * 1000);
 
 // ---------- start ----------
 app.listen(PORT, () => {
