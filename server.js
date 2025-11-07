@@ -2843,7 +2843,7 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
     }
 
     // Find the rule to update
-    const rule = settings.rules.find(r => r.name === name);
+    const rule = settings.NotificationRule.find(r => r.name === name);
     if (!rule) {
       console.log('[RULE_UPDATE] Rule not found:', name);
       console.log('[RULE_UPDATE] Available rules:', settings.NotificationRule.map(r => r.name));
