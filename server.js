@@ -1297,12 +1297,7 @@ app.post('/devices/register', auth, async (req, res) => {
     
     log(`[device] registered: user=${userId} device=${deviceId} app=${appType}`);
     
-    // Get user's device limits to return to client
-const user = await prisma.user.findUnique({
-  where: { id: userId },
-  select: { maxWindowsDevices: true, maxLinuxDevices: true }
-});
-
+    // Get user's device limits to return to client (reuses the user from line 1193)
 res.json({ 
   ok: true, 
   device,
@@ -1372,8 +1367,9 @@ app.get('/devices', auth, async (req, res) => {
     
     const canReset = await canResetDevice(userId);
     
-    const user = await prisma.user.findUnique({
-  where: { userId },
+// Get user's device limits
+const userLimits = await prisma.user.findUnique({
+  where: { id: userId },
   select: { maxWindowsDevices: true, maxLinuxDevices: true }
 });
 
@@ -1386,8 +1382,8 @@ res.json({
     lastResetAt: resetTokens?.lastResetAt || null
   },
   deviceLimits: {
-    maxWindows: user?.maxWindowsDevices || 1,
-    maxLinux: user?.maxLinuxDevices || 1
+    maxWindows: userLimits?.maxWindowsDevices || 1,
+    maxLinux: userLimits?.maxLinuxDevices || 1
   }
 });
   } catch (e) {
