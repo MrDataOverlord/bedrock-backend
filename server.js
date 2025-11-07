@@ -1141,11 +1141,13 @@ async function verifyPremiumDevice(req, res) {
   }
 }
 
-// ---------- Device Registration Endpoint ----------
+// ---------- Device Registration Endpoint - FIXED SLOT CHECKING ----------
 app.post('/devices/register', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
     const { deviceId, deviceName, appType, platform } = req.body || {};
+    
+    console.log(`[device/register] Registration attempt - User: ${userId}, Device: ${deviceId}, Platform: ${platform}`);
     
     // Validate inputs
     if (!deviceId || !appType || !platform) {
@@ -1159,10 +1161,11 @@ app.post('/devices/register', auth, async (req, res) => {
     // Verify premium status
     const hasPremium = await userHasActivePremium(userId);
     if (!hasPremium) {
+      console.log(`[device/register] User ${userId} does not have premium`);
       return res.status(403).json({ error: 'Premium subscription required' });
     }
     
-    // Check if this device is already registered
+    // ✅ STEP 1: Check if this device is already registered
     const existing = await prisma.authorizedDevice.findUnique({
       where: { 
         userId_deviceId_appType: { userId, deviceId, appType } 
@@ -1170,20 +1173,45 @@ app.post('/devices/register', auth, async (req, res) => {
     });
     
     if (existing) {
-      // Update last seen
+      console.log(`[device/register] Device ${deviceId} already exists, status: ${existing.active ? 'active' : 'inactive'}`);
+      
+      // ✅ Device exists - reactivate it (no slot check needed)
       await prisma.authorizedDevice.update({
         where: { id: existing.id },
-        data: { lastSeenAt: new Date(), active: true }
+        data: { 
+          lastSeenAt: new Date(), 
+          active: true,  // ✅ Reactivate device
+          deviceName: deviceName || existing.deviceName  // Update name if provided
+        }
       });
+      
+      // Get user's device limits for response
+      const userLimits = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { 
+          maxWindowsDevices: true, 
+          maxLinuxDevices: true 
+        }
+      });
+      
+      console.log(`[device/register] Device ${deviceId} reactivated successfully`);
       
       return res.json({ 
         ok: true, 
-        device: existing,
-        message: 'Device already registered' 
+        device: {
+          ...existing,
+          active: true,
+          lastSeenAt: new Date()
+        },
+        message: 'Device reactivated',
+        deviceLimits: {
+          maxWindows: userLimits?.maxWindowsDevices || 1,
+          maxLinux: userLimits?.maxLinuxDevices || 1
+        }
       });
     }
     
-    // Platform-specific device limit check
+    // ✅ STEP 2: Device doesn't exist - check platform and limits
     const isWindows = platform.toLowerCase().includes('windows');
     const isLinux = platform.toLowerCase().includes('linux');
 
@@ -1202,14 +1230,14 @@ app.post('/devices/register', auth, async (req, res) => {
         ? (user?.maxLinuxDevices || 1)
         : 1;
 
-    // Count active devices for this platform + appType
+    // ✅ STEP 3: Count ONLY active devices for this platform
     const platformKey = isWindows ? 'windows' : isLinux ? 'linux' : platform.toLowerCase();
 
     const activeDeviceCount = await prisma.authorizedDevice.count({
       where: {
         userId,
         appType,
-        active: true,
+        active: true,  // ✅ CRITICAL: Only count active devices
         platform: {
           contains: platformKey,
           mode: 'insensitive'
@@ -1217,12 +1245,14 @@ app.post('/devices/register', auth, async (req, res) => {
       }
     });
 
-    console.log(`[device/register] User ${userId} has ${activeDeviceCount}/${maxAllowed} active ${platformKey} devices for ${appType}`);
+    console.log(`[device/register] Active ${platformKey} devices: ${activeDeviceCount}/${maxAllowed}`);
 
-    // ⭐ NEW: Check if slots available
+    // ✅ STEP 4: Check if slots available
     const slotsAvailable = maxAllowed - activeDeviceCount;
 
     if (slotsAvailable <= 0) {
+      console.log(`[device/register] No slots available for ${platformKey} (${activeDeviceCount}/${maxAllowed})`);
+      
       // No slots available - get token info
       const resetTokens = await prisma.deviceResetToken.findUnique({
         where: { userId }
@@ -1251,8 +1281,8 @@ app.post('/devices/register', auth, async (req, res) => {
         platform: platformKey,
         currentCount: activeDeviceCount,
         maxAllowed: maxAllowed,
-        slotsAvailable: 0,  // ⭐ NEW
-        tokensRemaining: tokensRemaining,  // ⭐ NEW
+        slotsAvailable: 0,
+        tokensRemaining: tokensRemaining,
         existingDevices: existingDevices.map(d => ({
           id: d.id,
           name: d.deviceName,
@@ -1266,10 +1296,12 @@ app.post('/devices/register', auth, async (req, res) => {
       });
     }
     
-    // ✅ Slots available - register new device
+    // ✅ STEP 5: Slots available - register new device
+    console.log(`[device/register] Registering new device (${slotsAvailable} slots available)`);
+    
     const device = await prisma.authorizedDevice.create({
       data: {
-        id: `dev_${userId}_${Date.now()}`,  // ⭐ ADD ID
+        id: `dev_${userId}_${Date.now()}`,
         userId,
         deviceId,
         deviceName: deviceName || `${platform} Device`,
@@ -1286,7 +1318,7 @@ app.post('/devices/register', auth, async (req, res) => {
     const { ip } = getDeviceFingerprint(req);
     await prisma.deviceAuditLog.create({
       data: {
-        id: `dal_${userId}_${Date.now()}`,  // ⭐ ADD ID
+        id: `dal_${userId}_${Date.now()}`,
         userId,
         deviceId,
         appType,
@@ -1295,17 +1327,17 @@ app.post('/devices/register', auth, async (req, res) => {
       }
     });
     
-    log(`[device] registered: user=${userId} device=${deviceId} app=${appType}`);
+    console.log(`[device/register] Device ${deviceId} registered successfully`);
     
-    // Get user's device limits to return to client (reuses the user from line 1193)
-res.json({ 
-  ok: true, 
-  device,
-  deviceLimits: {
-    maxWindows: user?.maxWindowsDevices || 1,
-    maxLinux: user?.maxLinuxDevices || 1
-  }
-});
+    // Return response with device limits
+    res.json({ 
+      ok: true, 
+      device,
+      deviceLimits: {
+        maxWindows: user?.maxWindowsDevices || 1,
+        maxLinux: user?.maxLinuxDevices || 1
+      }
+    });
   } catch (e) {
     console.error('[devices/register] error:', e?.message || e);
     res.status(500).json({ error: 'Device registration failed' });
