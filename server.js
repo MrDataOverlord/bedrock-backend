@@ -1967,8 +1967,7 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
 
     console.log('[admin/set_device_limits] Updated device limits for', email);
 
-    // ⭐ AUTO-DEAUTH LOGIC STARTS HERE ⭐
-    // Auto-deauth oldest devices if admin lowered the limit
+    // ========== AUTO-DEAUTH LOGIC START ==========
     if (updateData.maxWindowsDevices !== undefined || updateData.maxLinuxDevices !== undefined) {
       console.log('[admin/set_device_limits] Checking for devices to auto-deauth...');
       
@@ -1981,7 +1980,7 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
             active: true,
             platform: { contains: 'windows', mode: 'insensitive' }
           },
-          orderBy: { lastSeenAt: 'asc' } // Oldest first
+          orderBy: { lastSeenAt: 'asc' }
         });
         
         const toDeauth = activeWindowsDevices.length - newWindowsLimit;
@@ -1996,7 +1995,6 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
             data: { active: false }
           });
           
-          // Audit log
           for (const device of devicesToDeauth) {
             await prisma.deviceAuditLog.create({
               data: {
@@ -2022,7 +2020,7 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
             active: true,
             platform: { contains: 'linux', mode: 'insensitive' }
           },
-          orderBy: { lastSeenAt: 'asc' } // Oldest first
+          orderBy: { lastSeenAt: 'asc' }
         });
         
         const toDeauth = activeLinuxDevices.length - newLinuxLimit;
@@ -2037,7 +2035,6 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
             data: { active: false }
           });
           
-          // Audit log
           for (const device of devicesToDeauth) {
             await prisma.deviceAuditLog.create({
               data: {
@@ -2054,7 +2051,7 @@ app.post('/admin/users/set_device_limits', adminAuth, async (req, res) => {
         }
       }
     }
-    // ⭐ AUTO-DEAUTH LOGIC ENDS HERE ⭐
+    // ========== AUTO-DEAUTH LOGIC END ==========
 
     res.json({
       ok: true,
