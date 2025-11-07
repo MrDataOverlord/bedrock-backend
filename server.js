@@ -595,7 +595,7 @@ app.post('/premium/notifications/migrate-patterns', auth, async (req, res) => {
     // Get existing notification settings
     const settings = await prisma.notificationSettings.findUnique({
       where: { userId },
-      include: { rules: true }
+      include: { NotificationRule: true }
     });
 
     if (!settings) {
@@ -735,7 +735,7 @@ app.get('/premium/notifications/debug-patterns', auth, async (req, res) => {
     
     const settings = await prisma.notificationSettings.findUnique({
       where: { userId },
-      include: { rules: true }
+      include: { NotificationRule: true }
     });
 
     const patterns = settings?.rules.map(rule => ({
@@ -2323,7 +2323,7 @@ app.delete('/auth/delete_account', auth, async (req, res) => {
         },
         memberships: true,
         notificationSettings: {
-          include: { rules: true }
+          include: { NotificationRule: true }
         },
         notificationTriggers: true
       }
@@ -2750,9 +2750,9 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
 
     // Get or create default notification settings
     let settings = await prisma.notificationSettings.findUnique({
-      where: { userId },
-      include: { rules: true }
-    });
+  where: { userId },
+  include: { NotificationRule: true } 
+});
 
     console.log('[DEBUG] Found existing settings:', !!settings);
 
@@ -2774,7 +2774,7 @@ settings = await prisma.notificationSettings.create({
       }))
     }
   },
-  include: { rules: true }
+  include: { NotificationRule: true }
 });
     }
 
@@ -2833,7 +2833,7 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
     // Get user's notification settings
     const settings = await prisma.notificationSettings.findUnique({
       where: { userId },
-      include: { rules: true }
+      include: { NotificationRule: true }
     });
 
     if (!settings) {
@@ -2845,7 +2845,7 @@ app.post('/premium/notifications/rule', auth, async (req, res) => {
     const rule = settings.rules.find(r => r.name === name);
     if (!rule) {
       console.log('[RULE_UPDATE] Rule not found:', name);
-      console.log('[RULE_UPDATE] Available rules:', settings.rules.map(r => r.name));
+      console.log('[RULE_UPDATE] Available rules:', settings.NotificationRule.map(r => r.name));
       return res.status(404).json({ error: 'Notification rule not found' });
     }
 
@@ -2931,7 +2931,7 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
       // First, delete all notification rules for this user
       const settings = await tx.notificationSettings.findUnique({
         where: { userId },
-        include: { rules: true }
+        include: { NotificationRule: true }
       });
 
       if (settings) {
@@ -2967,10 +2967,10 @@ app.post('/premium/notifications/reset', auth, async (req, res) => {
       }))
     }
   },
-  include: { rules: true }
+  include: { NotificationRule: true }
 });
 
-      console.log('[DEBUG] Created new settings with', newSettings.rules.length, 'rules');
+      console.log('[DEBUG] Created new settings with', newSettings.NotificationRule.length, 'rules');
     });
 
     console.log('[DEBUG] Reset completed successfully');
