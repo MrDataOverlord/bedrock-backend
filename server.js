@@ -1143,7 +1143,7 @@ async function verifyPremiumDevice(req, res) {
 
 // ---------- Device Registration Endpoint - FIXED SLOT CHECKING ----------
 // + Limit device registration attempts
-app.post('/devices/register', rateLimiter({ max: 10, window: '1h' }), auth, async (req, res) => {
+app.post('/devices/register', auth, async (req, res) => {
   try {
     const userId = req.user.sub;
     const { deviceId, deviceName, appType, platform } = req.body || {};
