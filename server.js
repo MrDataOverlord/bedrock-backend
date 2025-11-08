@@ -484,7 +484,14 @@ app.post('/auth/register/start', async (req, res) => {
 
     const cleanEmail = email.toLowerCase().trim();
     let user = await prisma.user.findUnique({ where: { email: cleanEmail } });
-    if (!user) user = await prisma.user.create({ data: { email: cleanEmail } });
+if (!user) {
+  user = await prisma.user.create({ 
+    data: { 
+      id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      email: cleanEmail 
+    } 
+  });
+}
 
     if (user.passwordHash) {
       return res.json({ ok: true, note: 'already_has_password' });
@@ -1836,8 +1843,11 @@ app.post('/admin/create_account', adminAuth, async (req, res) => {
     } else {
       // Create new user
       user = await prisma.user.create({ 
-        data: { email: cleanEmail }
-      });
+      data: { 
+      id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      email: cleanEmail 
+      }
+    });
       console.log('[admin/create_account] Created new user:', user.id);
     }
 
@@ -2582,35 +2592,43 @@ app.post('/billing/cleanup_subscriptions', auth, async (req, res) => {
 });
 
 // ---------- Stripe webhooks ----------
-app.post('/webhooks/stripe', async (req, res) => {
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
   try {
     const sig = req.headers['stripe-signature'];
-    // @ts-ignore
-    const raw = req.rawBody;
+    const raw = req.body; // Raw buffer from express.raw()
+    
     event = stripe.webhooks.constructEvent(raw, sig, STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error('[webhook] signature error:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
-
-  try { console.log('[webhook] received:', event.type, event.id); } catch {}
-
+  
+  try { 
+    console.log('[webhook] received:', event.type, event.id); 
+  } catch {}
+  
   try {
     switch (event.type) {
       case 'checkout.session.completed': {
         const s = event.data.object;
         const email = s.customer_details?.email || s.customer_email;
         console.log('[webhook] session.completed for email:', email, 'sub:', s.subscription);
-
+        
         if (!email) break;
-
         const cleanEmail = email.toLowerCase().trim();
-
-        // Ensure user
+        
+        // ✅ FIXED: Add id when creating user
         let user = await prisma.user.findUnique({ where: { email: cleanEmail } });
-        if (!user) user = await prisma.user.create({ data: { email: cleanEmail } });
-
+        if (!user) {
+          user = await prisma.user.create({ 
+            data: { 
+              id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              email: cleanEmail 
+            } 
+          });
+        }
+        
         // Registration mail if needed
         if (!user.passwordHash) {
           try {
@@ -2621,15 +2639,18 @@ app.post('/webhooks/stripe', async (req, res) => {
             console.error('[webhook] email send failed:', mailErr?.message || mailErr);
           }
         }
-
+        
         // Org/Member/Subscription sync
         const customerId = s.customer;
         if (customerId) {
           const cust = await getStripeCustomer(customerId);
           const org = await ensureOrgAndMember({
-            userId: user.id, customerId, customerName: cust?.name, email: cleanEmail
+            userId: user.id, 
+            customerId, 
+            customerName: cust?.name, 
+            email: cleanEmail
           });
-
+          
           if (s.subscription) {
             const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription.id;
             const sub = await stripe.subscriptions.retrieve(subId);
@@ -2639,44 +2660,52 @@ app.post('/webhooks/stripe', async (req, res) => {
         }
         break;
       }
-
+      
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted': {
         const sub = event.data.object;
         const customerId = sub.customer;
         if (!customerId) break;
-
+        
         const cust = await getStripeCustomer(customerId);
         const email = cust?.email?.toLowerCase()?.trim();
-
+        
+        // ✅ FIXED: Add id when creating user
         let user = email ? await prisma.user.findUnique({ where: { email } }) : null;
-        if (!user && email) user = await prisma.user.create({ data: { email } });
-
+        if (!user && email) {
+          user = await prisma.user.create({ 
+            data: { 
+              id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+              email 
+            } 
+          });
+        }
+        
         const org = await ensureOrgAndMember({
           userId: user?.id ?? undefined,
           customerId,
           customerName: cust?.name,
           email
         });
-
+        
         await upsertSubscription({ orgId: org.id, sub });
         console.log('[webhook] sub sync:', sub.id, 'status:', sub.status);
         break;
       }
-
+      
       case 'invoice.payment_succeeded':
       case 'invoice.payment_failed':
         // Optional: refresh via invoice.subscription
         break;
-
+      
       default:
         break;
     }
   } catch (e) {
     console.error('[webhook] handler error:', e);
   }
-
+  
   res.json({ received: true });
 });
 
