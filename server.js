@@ -1816,7 +1816,8 @@ app.post('/admin/grant_premium', adminAuth, async (req, res) => {
         provider: 'manual',
         status: 'active',
         currentPeriodEnd: periodEnd,
-        customerId: 'manual'
+        customerId: 'manual',
+        updatedAt: new Date()
       }
     });
 
@@ -1919,7 +1920,8 @@ app.post('/admin/create_account', adminAuth, async (req, res) => {
           provider: 'manual',
           status: 'active',
           currentPeriodEnd: periodEnd,
-          customerId: 'manual'
+          customerId: 'manual',
+          updatedAt: new Date()
         }
       });
 
