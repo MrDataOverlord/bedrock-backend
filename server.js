@@ -1785,7 +1785,12 @@ app.post('/admin/grant_premium', adminAuth, async (req, res) => {
 });
 
       await prisma.member.create({
-        data: { orgId: org.id, userId: user.id, role: 'owner' }
+        data: { 
+          id: `member_${org.id}_${user.id}_${Date.now()}`,
+          orgId: org.id, 
+          userId: user.id, 
+          role: 'owner' 
+        }
       });
     }
 
@@ -1889,7 +1894,12 @@ app.post('/admin/create_account', adminAuth, async (req, res) => {
 });
 
         await prisma.member.create({
-          data: { orgId: org.id, userId: user.id, role: 'owner' }
+          data: { 
+            id: `member_${org.id}_${user.id}_${Date.now()}`,
+            orgId: org.id, 
+            userId: user.id, 
+            role: 'owner' 
+          }
         });
       }
 
