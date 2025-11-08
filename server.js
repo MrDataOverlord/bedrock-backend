@@ -302,21 +302,30 @@ async function userHasActivePremium(userId) {
 
 async function ensureOrgAndMember({ userId, customerId, customerName, email }) {
   let org = await prisma.org.findFirst({ where: { stripeCustomerId: customerId } });
-
   if (!org) {
     const fallbackName = customerName || (email ? `${email.split('@')[0]}'s Org` : 'Account');
     org = await prisma.org.create({
-      data: { name: fallbackName, stripeCustomerId: customerId, ownerUserId: userId || null }
+      data: { 
+        id: `org_${customerId}_${Date.now()}`,  // ✅ FIXED: Added ID
+        name: fallbackName, 
+        stripeCustomerId: customerId, 
+        ownerUserId: userId || null 
+      }
     });
   } else if (userId && !org.ownerUserId) {
     org = await prisma.org.update({ where: { id: org.id }, data: { ownerUserId: userId } });
   }
-
+  
   if (userId) {
     await prisma.member.upsert({
       where: { orgId_userId: { orgId: org.id, userId } },
       update: {},
-      create: { orgId: org.id, userId, role: 'owner' }
+      create: { 
+        id: `member_${org.id}_${userId}`,  // ✅ FIXED: Added ID (if needed)
+        orgId: org.id, 
+        userId, 
+        role: 'owner' 
+      }
     });
   }
   return org;
@@ -1768,11 +1777,12 @@ app.post('/admin/grant_premium', adminAuth, async (req, res) => {
 
     if (!org) {
       org = await prisma.org.create({
-        data: { 
-          name: `${email.split('@')[0]}'s Org`,
-          ownerUserId: user.id
-        }
-      });
+    data: { 
+    id: `org_${user.id}_${Date.now()}`,
+    name: `${email.split('@')[0]}'s Org`,
+    ownerUserId: user.id
+  }
+});
 
       await prisma.member.create({
         data: { orgId: org.id, userId: user.id, role: 'owner' }
@@ -1871,11 +1881,12 @@ app.post('/admin/create_account', adminAuth, async (req, res) => {
 
       if (!org) {
         org = await prisma.org.create({
-          data: { 
-            name: `${cleanEmail.split('@')[0]}'s Org`,
-            ownerUserId: user.id
-          }
-        });
+    data: { 
+    id: `org_${user.id}_${Date.now()}`,  // ✅ ADD THIS
+    name: `${cleanEmail.split('@')[0]}'s Org`,
+    ownerUserId: user.id
+  }
+});
 
         await prisma.member.create({
           data: { orgId: org.id, userId: user.id, role: 'owner' }
