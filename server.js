@@ -223,7 +223,13 @@ async function issueRegistrationToken(userId) {
   const tokenHash = await bcrypt.hash(raw, 10);
   const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24); // 24h
   await prisma.passwordToken.create({
-    data: { userId, tokenHash, purpose: 'register', expiresAt },
+    data: { 
+      id: `ptoken_${userId}_${Date.now()}_register`,
+      userId, 
+      tokenHash, 
+      purpose: 'register', 
+      expiresAt 
+    },
   });
   return raw;
 }
@@ -481,22 +487,19 @@ app.post('/auth/register/start', async (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Missing email' });
-
     const cleanEmail = email.toLowerCase().trim();
     let user = await prisma.user.findUnique({ where: { email: cleanEmail } });
-if (!user) {
-  user = await prisma.user.create({ 
-    data: { 
-      id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      email: cleanEmail 
-    } 
-  });
-}
-
+    if (!user) {
+      user = await prisma.user.create({ 
+        data: { 
+          id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          email: cleanEmail 
+        } 
+      });
+    }
     if (user.passwordHash) {
       return res.json({ ok: true, note: 'already_has_password' });
     }
-
     const raw = await issueRegistrationToken(user.id);
     await sendRegistrationEmail(user.email, raw);
     res.json({ ok: true });
@@ -511,20 +514,25 @@ app.post('/auth/reset/start', async (req, res) => {
   try {
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'Missing email' });
-
     const cleanEmail = email.toLowerCase().trim();
     const user = await prisma.user.findUnique({ where: { email: cleanEmail } });
     if (!user) return res.json({ ok: true }); // Don't reveal if email exists
-
+    
     await invalidateTokensFor(user.id, 'reset');
-
     const raw = crypto.randomBytes(32).toString('hex');
     const tokenHash = await bcrypt.hash(raw, 10);
     const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24);
+    
     await prisma.passwordToken.create({
-      data: { userId: user.id, tokenHash, purpose: 'reset', expiresAt },
+      data: { 
+        id: `ptoken_${user.id}_${Date.now()}_reset`,  // ✅ FIXED
+        userId: user.id, 
+        tokenHash, 
+        purpose: 'reset', 
+        expiresAt 
+      },
     });
-
+    
     if (transporter) {
       const base = (REG_URL_BASE || '').replace(/\/+$/, '');
       const url = `${base}?token=${encodeURIComponent(raw)}&email=${encodeURIComponent(cleanEmail)}&mode=reset`;
@@ -535,9 +543,8 @@ app.post('/auth/reset/start', async (req, res) => {
         html: `<p>Click to reset your password:</p><p><a href="${url}">${url}</a></p>`,
       });
     } else {
-      log('[mail] reset requested but SMTP not configured');
+      console.log('[mail] reset requested but SMTP not configured');
     }
-
     res.json({ ok: true });
   } catch (e) {
     console.error('[reset/start] error:', e?.message || e);
@@ -550,21 +557,20 @@ app.post('/auth/reset/complete', async (req, res) => {
   try {
     const { token, newPassword, confirmPassword } = req.body || {};
     if (!token || !newPassword) return res.status(400).json({ error: 'Missing fields' });
-
+    
     // Policy enforcement
     const v = validatePasswordPolicy(newPassword);
     if (!v.ok) return res.status(400).json({ error: `Password requirements: ${v.issues.join(', ')}` });
-
     if (typeof confirmPassword === 'string' && confirmPassword !== newPassword) {
       return res.status(400).json({ error: 'Passwords do not match' });
     }
-
+    
     // Get all unused reset tokens and find the matching one
     const tokens = await prisma.passwordToken.findMany({
       where: { purpose: 'reset', usedAt: null, expiresAt: { gt: new Date() } },
       orderBy: { createdAt: 'desc' },
     });
-
+    
     let validToken = null;
     for (const tok of tokens) {
       if (await bcrypt.compare(token, tok.tokenHash)) {
@@ -572,15 +578,15 @@ app.post('/auth/reset/complete', async (req, res) => {
         break;
       }
     }
-
+    
     if (!validToken) return res.status(400).json({ error: 'Token not found or expired' });
-
+    
     const hash = await bcrypt.hash(newPassword, 10);
     await prisma.$transaction([
       prisma.user.update({ where: { id: validToken.userId }, data: { passwordHash: hash } }),
       prisma.passwordToken.update({ where: { id: validToken.id }, data: { usedAt: new Date() } }),
     ]);
-
+    
     res.json({ ok: true });
   } catch (e) {
     console.error('[reset/complete] error:', e?.message || e);
