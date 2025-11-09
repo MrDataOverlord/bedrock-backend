@@ -2490,11 +2490,11 @@ app.delete('/auth/delete_account', auth, async (req, res) => {
             members: true
           }
         },
-        Member: true,  // ⭐ FIX: Capital M, not "memberships"
-        notificationSettings: {
+        Member: true,
+        NotificationSettings: {  // ⭐ FIX: Capital N and S
           include: { NotificationRule: true }
         },
-        notificationTriggers: true
+        NotificationTrigger: true  // ⭐ FIX: Capital N and T, singular
       }
     });
 
@@ -2550,12 +2550,12 @@ app.delete('/auth/delete_account', auth, async (req, res) => {
       });
 
       // Delete notification rules and settings
-      if (user.notificationSettings) {
+      if (user.NotificationSettings) {  // ⭐ FIX: Capital N and S
         await tx.notificationRule.deleteMany({
-          where: { settingsId: user.notificationSettings.id }
+          where: { settingsId: user.NotificationSettings.id }
         });
         await tx.notificationSettings.delete({
-          where: { id: user.notificationSettings.id }
+          where: { id: user.NotificationSettings.id }
         });
       }
 
