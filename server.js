@@ -2223,6 +2223,107 @@ app.post('/admin/users/grant_reset_tokens', adminAuth, async (req, res) => {
   }
 });
 
+// Manually register a device for a user (ADMIN ONLY)
+// Use this to fix broken device registrations
+app.post('/admin/users/register_device', adminAuth, async (req, res) => {
+  try {
+    const { email, deviceId, deviceName, appType, platform } = req.body;
+    
+    if (!email || !isEmail(email)) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+    
+    if (!deviceId || !appType || !platform) {
+      return res.status(400).json({ error: 'deviceId, appType, and platform are required' });
+    }
+    
+    if (!['commander', 'server-manager'].includes(appType)) {
+      return res.status(400).json({ error: 'appType must be commander or server-manager' });
+    }
+    
+    if (!['windows', 'linux'].includes(platform.toLowerCase())) {
+      return res.status(400).json({ error: 'platform must be windows or linux' });
+    }
+
+    console.log('[admin/register_device] Manually registering device for:', email);
+    console.log('[admin/register_device] Device:', deviceId, 'Platform:', platform, 'AppType:', appType);
+
+    const user = await prisma.user.findUnique({ 
+      where: { email: email.toLowerCase().trim() } 
+    });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check if device already exists
+    const existingDevice = await prisma.authorizedDevice.findUnique({
+      where: { deviceId }
+    });
+    
+    if (existingDevice) {
+      // Update existing device
+      await prisma.authorizedDevice.update({
+        where: { deviceId },
+        data: {
+          userId: user.id,
+          deviceName: deviceName || `${platform} Device`,
+          appType,
+          platform: platform.toLowerCase(),
+          active: true,
+          lastSeenAt: new Date()
+        }
+      });
+      
+      console.log('[admin/register_device] Updated existing device');
+    } else {
+      // Create new device
+      await prisma.authorizedDevice.create({
+        data: {
+          id: `dev_${user.id}_${Date.now()}`,
+          userId: user.id,
+          deviceId,
+          deviceName: deviceName || `${platform} Device`,
+          appType,
+          platform: platform.toLowerCase(),
+          active: true,
+          lastSeenAt: new Date()
+        }
+      });
+      
+      console.log('[admin/register_device] Created new device');
+    }
+    
+    // Ensure user has reset tokens
+    await generateDeviceResetTokens(user.id);
+    
+    // Audit log
+    await prisma.deviceAuditLog.create({
+      data: {
+        id: `dal_${user.id}_${Date.now()}`,
+        userId: user.id,
+        deviceId,
+        appType,
+        action: 'admin_registered',
+        ipAddress: '0.0.0.0' // Admin action
+      }
+    });
+
+    res.json({
+      ok: true,
+      message: `Device ${deviceId} registered for ${email}`,
+      deviceId
+    });
+
+  } catch (e) {
+    console.error('[admin/register_device] error:', e?.message || e);
+    res.status(500).json({ 
+      error: 'Failed to register device', 
+      detail: e?.message 
+    });
+  }
+});
+
 // Get user's device status (for admin panel)
 app.get('/admin/users/:email/devices', adminAuth, async (req, res) => {
   try {
