@@ -1847,6 +1847,29 @@ app.post('/admin/grant_premium', adminAuth, async (req, res) => {
       }
     });
 
+    // ⭐ NEW: Create notification settings with default rules for premium users
+    console.log('[admin/grant_premium] Creating default notification settings and rules...');
+    const defaultRules = createDefaultNotificationRules();
+    
+    await prisma.notificationSettings.upsert({
+      where: { userId: user.id },
+      create: {
+        id: `ns_${user.id}_${Date.now()}`,
+        userId: user.id,
+        soundEnabled: false,
+        updatedAt: new Date(),
+        NotificationRule: {
+          create: defaultRules.map((rule, index) => ({
+            id: `nr_${user.id}_${Date.now()}_${index}`,
+            ...rule
+          }))
+        }
+      },
+      update: {} // Do nothing if already exists
+    });
+    
+    console.log('[admin/grant_premium] Created notification settings with', defaultRules.length, 'default rules');
+
     console.log('[admin/grant_premium] Premium granted to', email, 'until:', periodEnd);
 
     res.json({
@@ -1950,6 +1973,29 @@ app.post('/admin/create_account', adminAuth, async (req, res) => {
           updatedAt: new Date()
         }
       });
+
+      // ⭐ NEW: Create notification settings with default rules for premium users
+      console.log('[admin/create_account] Creating default notification settings and rules...');
+      const defaultRules = createDefaultNotificationRules();
+      
+      await prisma.notificationSettings.upsert({
+        where: { userId: user.id },
+        create: {
+          id: `ns_${user.id}_${Date.now()}`,
+          userId: user.id,
+          soundEnabled: false,
+          updatedAt: new Date(),
+          NotificationRule: {
+            create: defaultRules.map((rule, index) => ({
+              id: `nr_${user.id}_${Date.now()}_${index}`,
+              ...rule
+            }))
+          }
+        },
+        update: {} // Do nothing if already exists
+      });
+      
+      console.log('[admin/create_account] Created notification settings with', defaultRules.length, 'default rules');
 
       premiumInfo = {
         granted: true,
