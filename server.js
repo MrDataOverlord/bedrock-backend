@@ -259,15 +259,15 @@ function validatePasswordPolicy(pw) {
   return { ok: issues.length === 0, issues };
 }
 
-// ---------- Stripe raw-body ----------
-app.use(express.json({
-  verify: (req, _res, buf) => {
-    if (req.originalUrl === '/webhooks/stripe') {
-      // @ts-ignore
-      req.rawBody = buf;
-    }
+// ---------- Body parsing ----------
+// CRITICAL: Exclude webhook path from JSON parsing so Stripe can verify signatures
+app.use((req, res, next) => {
+  if (req.originalUrl === '/webhooks/stripe') {
+    next(); // Skip JSON parsing for webhook
+  } else {
+    express.json()(req, res, next); // Apply JSON parsing to all other routes
   }
-}));
+});
 
 // ---------- Org / Member / Subscription ----------
 // Updated to recognize canceled subscriptions that still have time left
@@ -1160,6 +1160,32 @@ async function verifyPremiumDevice(req, res) {
   } catch (error) {
     console.error('[DEVICE_CHECK] Error:', error);
     return { authorized: false, error: 'Device verification failed' };
+  }
+}
+
+// Helper function to ensure user has reset tokens
+async function generateDeviceResetTokens(userId) {
+  try {
+    // Check if user already has reset tokens
+    const existing = await prisma.deviceResetToken.findUnique({
+      where: { userId }
+    });
+
+    if (!existing) {
+      // Create default reset tokens (2 tokens per month standard)
+      await prisma.deviceResetToken.create({
+        data: {
+          id: `drt_${userId}_${Date.now()}`,
+          userId,
+          tokensRemaining: 2,
+          updatedAt: new Date()
+        }
+      });
+      console.log(`[generateDeviceResetTokens] Created default reset tokens for user ${userId}`);
+    }
+  } catch (error) {
+    console.error('[generateDeviceResetTokens] Error:', error?.message || error);
+    // Don't throw - this is not critical to device registration
   }
 }
 
