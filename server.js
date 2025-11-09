@@ -2256,28 +2256,31 @@ app.post('/admin/users/register_device', adminAuth, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Check if device already exists
+    // Check if device already exists using compound unique key
     const existingDevice = await prisma.authorizedDevice.findUnique({
-      where: { deviceId }
+      where: { 
+        userId_deviceId_appType: {
+          userId: user.id,
+          deviceId: deviceId,
+          appType: appType
+        }
+      }
     });
     
     if (existingDevice) {
       // Update existing device
       await prisma.authorizedDevice.update({
-        where: { deviceId },
+        where: { id: existingDevice.id },
         data: {
-          userId: user.id,
           deviceName: deviceName || `${platform} Device`,
-          appType,
           platform: platform.toLowerCase(),
-          active: true,
-          lastSeenAt: new Date()
+          active: true
         }
       });
       
       console.log('[admin/register_device] Updated existing device');
     } else {
-      // Create new device
+      // Create new device (matches normal registration flow)
       await prisma.authorizedDevice.create({
         data: {
           id: `dev_${user.id}_${Date.now()}`,
@@ -2286,8 +2289,7 @@ app.post('/admin/users/register_device', adminAuth, async (req, res) => {
           deviceName: deviceName || `${platform} Device`,
           appType,
           platform: platform.toLowerCase(),
-          active: true,
-          lastSeenAt: new Date()
+          active: true
         }
       });
       
