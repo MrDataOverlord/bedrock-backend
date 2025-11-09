@@ -2490,7 +2490,7 @@ app.delete('/auth/delete_account', auth, async (req, res) => {
             members: true
           }
         },
-        memberships: true,
+        Member: true,  // ⭐ FIX: Capital M, not "memberships"
         notificationSettings: {
           include: { NotificationRule: true }
         },
@@ -2561,6 +2561,19 @@ app.delete('/auth/delete_account', auth, async (req, res) => {
 
       // Delete password tokens
       await tx.passwordToken.deleteMany({
+        where: { userId }
+      });
+      
+      // ⭐ NEW: Delete device-related data
+      await tx.deviceAuditLog.deleteMany({
+        where: { userId }
+      });
+      
+      await tx.authorizedDevice.deleteMany({
+        where: { userId }
+      });
+      
+      await tx.deviceResetToken.deleteMany({
         where: { userId }
       });
 
