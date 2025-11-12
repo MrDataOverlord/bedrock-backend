@@ -342,11 +342,17 @@ async function upsertSubscription({ orgId, sub }) {
       provider: 'stripe',
       status: sub.status,
       currentPeriodEnd: end,
-      customerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id
+      customerId: typeof sub.customer === 'string' ? sub.customer : sub.customer?.id,
+      updatedAt: new Date()  // ⭐ ADDED: Required by Prisma schema
     },
-    update: { status: sub.status, currentPeriodEnd: end }
+    update: { 
+      status: sub.status, 
+      currentPeriodEnd: end,
+      updatedAt: new Date()  // ⭐ ADDED: Required by Prisma schema
+    }
   });
 }
+
 
 const getStripeCustomer = async (customerId) => {
   try { return await stripe.customers.retrieve(customerId); }
