@@ -2869,14 +2869,36 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
           });
           
           if (s.subscription) {
-            const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription.id;
-            const sub = await stripe.subscriptions.retrieve(subId);
-            await upsertSubscription({ orgId: org.id, sub });
-            console.log('[webhook] sub upserted:', subId, 'status:', sub.status);
-          }
+  const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription.id;
+  const sub = await stripe.subscriptions.retrieve(subId);
+  await upsertSubscription({ orgId: org.id, sub });
+  console.log('[webhook] sub upserted:', subId, 'status:', sub.status);
+  
+  // ⭐ NEW: Initialize notification settings for active premium subscription
+  if (sub.status === 'active' || sub.status === 'trialing') {
+    console.log('[webhook] Creating notification settings for premium user...');
+    const defaultRules = createDefaultNotificationRules();
+    
+    await prisma.notificationSettings.upsert({
+      where: { userId: user.id },
+      create: {
+        id: `ns_${user.id}_${Date.now()}`,
+        userId: user.id,
+        soundEnabled: false,
+        updatedAt: new Date(),
+        NotificationRule: {
+          create: defaultRules.map((rule, index) => ({
+            id: `nr_${user.id}_${Date.now()}_${index}`,
+            ...rule
+          }))
         }
-        break;
-      }
+      },
+      update: {} // Do nothing if already exists
+    });
+    
+    console.log('[webhook] ✅ Notification settings created with', defaultRules.length, 'rules');
+  }
+}
       
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
@@ -2907,8 +2929,38 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         });
         
         await upsertSubscription({ orgId: org.id, sub });
-        console.log('[webhook] sub sync:', sub.id, 'status:', sub.status);
-        break;
+console.log('[webhook] sub sync:', sub.id, 'status:', sub.status);
+
+// ⭐ NEW: Initialize notification settings if subscription is now active
+if (user && (sub.status === 'active' || sub.status === 'trialing')) {
+  // Check if settings already exist
+  const existingSettings = await prisma.notificationSettings.findUnique({
+    where: { userId: user.id }
+  });
+  
+  if (!existingSettings) {
+    console.log('[webhook] Creating notification settings for premium user...');
+    const defaultRules = createDefaultNotificationRules();
+    
+    await prisma.notificationSettings.create({
+      data: {
+        id: `ns_${user.id}_${Date.now()}`,
+        userId: user.id,
+        soundEnabled: false,
+        updatedAt: new Date(),
+        NotificationRule: {
+          create: defaultRules.map((rule, index) => ({
+            id: `nr_${user.id}_${Date.now()}_${index}`,
+            ...rule
+          }))
+        }
+      }
+    });
+    
+    console.log('[webhook] ✅ Notification settings created with', defaultRules.length, 'rules');
+  }
+}
+break;
       }
       
       case 'invoice.payment_succeeded':
