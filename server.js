@@ -2899,7 +2899,11 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
     console.log('[webhook] ✅ Notification settings created with', defaultRules.length, 'rules');
   }
 }
+        }
+        break;
+      }
       
+      case 'customer.subscription.created':   
       case 'customer.subscription.created':
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted': {
