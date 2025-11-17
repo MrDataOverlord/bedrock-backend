@@ -1230,38 +1230,127 @@ app.post('/devices/register', auth, async (req, res) => {
     if (existing) {
       console.log(`[device/register] Device ${deviceId} already exists, status: ${existing.active ? 'active' : 'inactive'}`);
       
-      // ✅ Device exists - reactivate it (no slot check needed)
+      // ⭐ If device is ACTIVE, just update lastSeenAt
+      if (existing.active) {
+        await prisma.authorizedDevice.update({
+          where: { id: existing.id },
+          data: { 
+            lastSeenAt: new Date(),
+            deviceName: deviceName || existing.deviceName
+          }
+        });
+        
+        const userLimits = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { maxWindowsDevices: true, maxLinuxDevices: true }
+        });
+        
+        console.log(`[device/register] Active device ${deviceId} checked in`);
+        
+        return res.json({ 
+          ok: true, 
+          device: { ...existing, lastSeenAt: new Date() },
+          message: 'Device already registered',
+          deviceLimits: {
+            maxWindows: userLimits?.maxWindowsDevices || 1,
+            maxLinux: userLimits?.maxLinuxDevices || 1
+          }
+        });
+      }
+      
+      // ⭐ Device exists but is INACTIVE - CHECK LIMITS before reactivating!
+      const isWindows = platform.toLowerCase().includes('windows');
+      const isLinux = platform.toLowerCase().includes('linux');
+      const platformKey = isWindows ? 'windows' : isLinux ? 'linux' : platform.toLowerCase();
+      
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { maxWindowsDevices: true, maxLinuxDevices: true }
+      });
+      
+      const maxAllowed = isWindows 
+        ? (user?.maxWindowsDevices || 1)
+        : isLinux 
+          ? (user?.maxLinuxDevices || 1)
+          : 1;
+      
+      // Count OTHER active devices (excluding this inactive one)
+      const activeDeviceCount = await prisma.authorizedDevice.count({
+        where: {
+          userId,
+          appType,
+          active: true,
+          platform: { contains: platformKey, mode: 'insensitive' },
+          NOT: { id: existing.id }  // ⭐ CRITICAL: Exclude this device from count!
+        }
+      });
+      
+      const slotsAvailable = maxAllowed - activeDeviceCount;
+      
+      console.log(`[device/register] Reactivation check: ${activeDeviceCount}/${maxAllowed} active (${slotsAvailable} slots)`);
+      
+      // ⭐ If NO slots, return device limit error (same as new device registration)
+      if (slotsAvailable <= 0) {
+        console.log(`[device/register] Cannot reactivate - no slots available`);
+        
+        const resetTokens = await prisma.deviceResetToken.findUnique({
+          where: { userId }
+        });
+        
+        const tokensRemaining = resetTokens?.tokensRemaining || 0;
+        
+        const existingDevices = await prisma.authorizedDevice.findMany({
+          where: {
+            userId,
+            appType,
+            active: true,
+            platform: { contains: platformKey, mode: 'insensitive' }
+          },
+          orderBy: { lastSeenAt: 'desc' },
+          take: 5
+        });
+        
+        // ⭐ Return 409 error - same as new device registration
+        return res.status(409).json({ 
+          error: 'Device limit reached',
+          code: 'DEVICE_LIMIT_REACHED',
+          platform: platformKey,
+          currentCount: activeDeviceCount,
+          maxAllowed: maxAllowed,
+          slotsAvailable: 0,
+          tokensRemaining: tokensRemaining,
+          existingDevices: existingDevices.map(d => ({
+            id: d.id,
+            name: d.deviceName,
+            deviceId: d.deviceId,
+            registeredAt: d.registeredAt,
+            lastSeenAt: d.lastSeenAt
+          })),
+          message: tokensRemaining > 0 
+            ? `Device limit reached. You have ${tokensRemaining} reset token(s) available.`
+            : `Device limit reached. No reset tokens available. Visit nerdherdmc.net/accounts to manage devices.`
+        });
+      }
+      
+      // ⭐ Slots available - safe to reactivate
       await prisma.authorizedDevice.update({
         where: { id: existing.id },
         data: { 
           lastSeenAt: new Date(), 
-          active: true,  // ✅ Reactivate device
-          deviceName: deviceName || existing.deviceName  // Update name if provided
+          active: true,
+          deviceName: deviceName || existing.deviceName
         }
       });
       
-      // Get user's device limits for response
-      const userLimits = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { 
-          maxWindowsDevices: true, 
-          maxLinuxDevices: true 
-        }
-      });
-      
-      console.log(`[device/register] Device ${deviceId} reactivated successfully`);
+      console.log(`[device/register] Device ${deviceId} reactivated (${activeDeviceCount + 1}/${maxAllowed})`);
       
       return res.json({ 
         ok: true, 
-        device: {
-          ...existing,
-          active: true,
-          lastSeenAt: new Date()
-        },
+        device: { ...existing, active: true, lastSeenAt: new Date() },
         message: 'Device reactivated',
         deviceLimits: {
-          maxWindows: userLimits?.maxWindowsDevices || 1,
-          maxLinux: userLimits?.maxLinuxDevices || 1
+          maxWindows: user?.maxWindowsDevices || 1,
+          maxLinux: user?.maxLinuxDevices || 1
         }
       });
     }
