@@ -2507,6 +2507,203 @@ app.get('/admin/users/:email/devices', adminAuth, async (req, res) => {
   }
 });
 
+// Admin endpoint: Clean up users with too many active devices
+app.post('/admin/cleanup_excess_devices', adminAuth, async (req, res) => {
+  try {
+    const { dryRun = true, platform = 'all' } = req.body || {};
+    
+    console.log(`[admin/cleanup_excess_devices] Starting cleanup (dryRun: ${dryRun}, platform: ${platform})`);
+    
+    const results = {
+      dryRun,
+      timestamp: new Date().toISOString(),
+      windowsUsers: [],
+      linuxUsers: [],
+      summary: {
+        windowsAffected: 0,
+        linuxAffected: 0,
+        totalDevicesDeactivated: 0
+      }
+    };
+    
+    // ===== WINDOWS CLEANUP =====
+    if (platform === 'all' || platform === 'windows') {
+      // Find users with too many Windows devices
+      const windowsUsers = await prisma.$queryRaw`
+        SELECT 
+          u.id as userId,
+          u.email,
+          u.maxWindowsDevices as deviceLimit,
+          COUNT(ad.id) as activeDeviceCount
+        FROM User u
+        INNER JOIN AuthorizedDevice ad ON ad.userId = u.id
+        WHERE ad.active = true 
+          AND ad.appType = 'commander'
+          AND LOWER(ad.platform) LIKE '%windows%'
+        GROUP BY u.id, u.email, u.maxWindowsDevices
+        HAVING COUNT(ad.id) > u.maxWindowsDevices
+      `;
+      
+      console.log(`[admin/cleanup] Found ${windowsUsers.length} Windows users with excess devices`);
+      
+      for (const user of windowsUsers) {
+        const excessCount = user.activeDeviceCount - user.deviceLimit;
+        
+        // Get all Windows devices for this user, ordered by lastSeenAt (oldest first)
+        const devices = await prisma.authorizedDevice.findMany({
+          where: {
+            userId: user.userId,
+            appType: 'commander',
+            active: true,
+            platform: { contains: 'windows', mode: 'insensitive' }
+          },
+          orderBy: { lastSeenAt: 'asc' }, // Oldest first
+          take: excessCount // Only get the excess devices
+        });
+        
+        const userResult = {
+          email: user.email,
+          userId: user.userId,
+          limit: user.deviceLimit,
+          activeCount: user.activeDeviceCount,
+          excessCount: excessCount,
+          devicesToDeactivate: devices.map(d => ({
+            id: d.id,
+            deviceId: d.deviceId,
+            deviceName: d.deviceName,
+            registeredAt: d.registeredAt,
+            lastSeenAt: d.lastSeenAt
+          }))
+        };
+        
+        // ⭐ If NOT dry-run, actually deactivate the devices
+        if (!dryRun) {
+          for (const device of devices) {
+            await prisma.authorizedDevice.update({
+              where: { id: device.id },
+              data: { active: false }
+            });
+            
+            // Audit log
+            await prisma.deviceAuditLog.create({
+              data: {
+                id: `dal_cleanup_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                userId: user.userId,
+                deviceId: device.deviceId,
+                appType: 'commander',
+                action: 'deactivated_excess',
+                ipAddress: 'admin_cleanup'
+              }
+            });
+            
+            console.log(`[admin/cleanup] Deactivated device ${device.deviceName} for ${user.email}`);
+          }
+          
+          results.summary.totalDevicesDeactivated += devices.length;
+        }
+        
+        results.windowsUsers.push(userResult);
+        results.summary.windowsAffected++;
+      }
+    }
+    
+    // ===== LINUX CLEANUP =====
+    if (platform === 'all' || platform === 'linux') {
+      // Find users with too many Linux devices
+      const linuxUsers = await prisma.$queryRaw`
+        SELECT 
+          u.id as userId,
+          u.email,
+          u.maxLinuxDevices as deviceLimit,
+          COUNT(ad.id) as activeDeviceCount
+        FROM User u
+        INNER JOIN AuthorizedDevice ad ON ad.userId = u.id
+        WHERE ad.active = true 
+          AND ad.appType = 'commander'
+          AND LOWER(ad.platform) LIKE '%linux%'
+        GROUP BY u.id, u.email, u.maxLinuxDevices
+        HAVING COUNT(ad.id) > u.maxLinuxDevices
+      `;
+      
+      console.log(`[admin/cleanup] Found ${linuxUsers.length} Linux users with excess devices`);
+      
+      for (const user of linuxUsers) {
+        const excessCount = user.activeDeviceCount - user.deviceLimit;
+        
+        // Get all Linux devices for this user, ordered by lastSeenAt (oldest first)
+        const devices = await prisma.authorizedDevice.findMany({
+          where: {
+            userId: user.userId,
+            appType: 'commander',
+            active: true,
+            platform: { contains: 'linux', mode: 'insensitive' }
+          },
+          orderBy: { lastSeenAt: 'asc' },
+          take: excessCount
+        });
+        
+        const userResult = {
+          email: user.email,
+          userId: user.userId,
+          limit: user.deviceLimit,
+          activeCount: user.activeDeviceCount,
+          excessCount: excessCount,
+          devicesToDeactivate: devices.map(d => ({
+            id: d.id,
+            deviceId: d.deviceId,
+            deviceName: d.deviceName,
+            registeredAt: d.registeredAt,
+            lastSeenAt: d.lastSeenAt
+          }))
+        };
+        
+        // If NOT dry-run, deactivate
+        if (!dryRun) {
+          for (const device of devices) {
+            await prisma.authorizedDevice.update({
+              where: { id: device.id },
+              data: { active: false }
+            });
+            
+            await prisma.deviceAuditLog.create({
+              data: {
+                id: `dal_cleanup_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                userId: user.userId,
+                deviceId: device.deviceId,
+                appType: 'commander',
+                action: 'deactivated_excess',
+                ipAddress: 'admin_cleanup'
+              }
+            });
+            
+            console.log(`[admin/cleanup] Deactivated device ${device.deviceName} for ${user.email}`);
+          }
+          
+          results.summary.totalDevicesDeactivated += devices.length;
+        }
+        
+        results.linuxUsers.push(userResult);
+        results.summary.linuxAffected++;
+      }
+    }
+    
+    // Summary
+    console.log(`[admin/cleanup] Complete - Affected users: ${results.summary.windowsAffected + results.summary.linuxAffected}, Devices deactivated: ${results.summary.totalDevicesDeactivated}`);
+    
+    res.json({
+      ok: true,
+      message: dryRun 
+        ? `DRY RUN: Found ${results.summary.windowsAffected + results.summary.linuxAffected} users with excess devices. No changes made.`
+        : `Cleanup complete: Deactivated ${results.summary.totalDevicesDeactivated} excess devices for ${results.summary.windowsAffected + results.summary.linuxAffected} users.`,
+      results
+    });
+    
+  } catch (e) {
+    console.error('[admin/cleanup_excess_devices] error:', e?.message || e);
+    res.status(500).json({ error: 'Cleanup failed', details: e?.message });
+  }
+});
+
 // ========== END OF ADMIN ENDPOINTS ==========
 
 // Cancel subscription (keeps access until period end) - FIXED VERSION
