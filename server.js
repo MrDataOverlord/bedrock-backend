@@ -2528,163 +2528,179 @@ app.post('/admin/cleanup_excess_devices', adminAuth, async (req, res) => {
     
     // ===== WINDOWS CLEANUP =====
     if (platform === 'all' || platform === 'windows') {
-      // Find users with too many Windows devices
-      const windowsUsers = await prisma.$queryRaw`
-        SELECT 
-          u.id as userId,
-          u.email,
-          u.maxWindowsDevices as deviceLimit,
-          COUNT(ad.id) as activeDeviceCount
-        FROM User u
-        INNER JOIN AuthorizedDevice ad ON ad.userId = u.id
-        WHERE ad.active = true 
-          AND ad.appType = 'commander'
-          AND LOWER(ad.platform) LIKE '%windows%'
-        GROUP BY u.id, u.email, u.maxWindowsDevices
-        HAVING COUNT(ad.id) > u.maxWindowsDevices
-      `;
+      // Get all users
+      const allUsers = await prisma.user.findMany({
+        select: {
+          id: true,
+          email: true,
+          maxWindowsDevices: true
+        }
+      });
       
-      console.log(`[admin/cleanup] Found ${windowsUsers.length} Windows users with excess devices`);
+      console.log(`[admin/cleanup] Checking ${allUsers.length} users for Windows device violations`);
       
-      for (const user of windowsUsers) {
-        const excessCount = user.activeDeviceCount - user.deviceLimit;
-        
-        // Get all Windows devices for this user, ordered by lastSeenAt (oldest first)
-        const devices = await prisma.authorizedDevice.findMany({
+      for (const user of allUsers) {
+        // Count active Windows devices for this user
+        const activeDeviceCount = await prisma.authorizedDevice.count({
           where: {
-            userId: user.userId,
+            userId: user.id,
             appType: 'commander',
             active: true,
             platform: { contains: 'windows', mode: 'insensitive' }
-          },
-          orderBy: { lastSeenAt: 'asc' }, // Oldest first
-          take: excessCount // Only get the excess devices
+          }
         });
         
-        const userResult = {
-          email: user.email,
-          userId: user.userId,
-          limit: user.deviceLimit,
-          activeCount: user.activeDeviceCount,
-          excessCount: excessCount,
-          devicesToDeactivate: devices.map(d => ({
-            id: d.id,
-            deviceId: d.deviceId,
-            deviceName: d.deviceName,
-            registeredAt: d.registeredAt,
-            lastSeenAt: d.lastSeenAt
-          }))
-        };
-        
-        // ⭐ If NOT dry-run, actually deactivate the devices
-        if (!dryRun) {
-          for (const device of devices) {
-            await prisma.authorizedDevice.update({
-              where: { id: device.id },
-              data: { active: false }
-            });
+        // Check if over limit
+        if (activeDeviceCount > user.maxWindowsDevices) {
+          const excessCount = activeDeviceCount - user.maxWindowsDevices;
+          
+          // Get all Windows devices for this user, ordered by lastSeenAt (oldest first)
+          const devices = await prisma.authorizedDevice.findMany({
+            where: {
+              userId: user.id,
+              appType: 'commander',
+              active: true,
+              platform: { contains: 'windows', mode: 'insensitive' }
+            },
+            orderBy: { lastSeenAt: 'asc' }, // Oldest first
+            take: excessCount // Only get the excess devices
+          });
+          
+          const userResult = {
+            email: user.email,
+            userId: user.id,
+            limit: user.maxWindowsDevices,
+            activeCount: activeDeviceCount,
+            excessCount: excessCount,
+            devicesToDeactivate: devices.map(d => ({
+              id: d.id,
+              deviceId: d.deviceId,
+              deviceName: d.deviceName,
+              registeredAt: d.registeredAt,
+              lastSeenAt: d.lastSeenAt
+            }))
+          };
+          
+          // ⭐ If NOT dry-run, actually deactivate the devices
+          if (!dryRun) {
+            for (const device of devices) {
+              await prisma.authorizedDevice.update({
+                where: { id: device.id },
+                data: { active: false }
+              });
+              
+              // Audit log
+              await prisma.deviceAuditLog.create({
+                data: {
+                  id: `dal_cleanup_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                  userId: user.id,
+                  deviceId: device.deviceId,
+                  appType: 'commander',
+                  action: 'deactivated_excess',
+                  ipAddress: 'admin_cleanup'
+                }
+              });
+              
+              console.log(`[admin/cleanup] Deactivated device ${device.deviceName} for ${user.email}`);
+            }
             
-            // Audit log
-            await prisma.deviceAuditLog.create({
-              data: {
-                id: `dal_cleanup_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                userId: user.userId,
-                deviceId: device.deviceId,
-                appType: 'commander',
-                action: 'deactivated_excess',
-                ipAddress: 'admin_cleanup'
-              }
-            });
-            
-            console.log(`[admin/cleanup] Deactivated device ${device.deviceName} for ${user.email}`);
+            results.summary.totalDevicesDeactivated += devices.length;
           }
           
-          results.summary.totalDevicesDeactivated += devices.length;
+          results.windowsUsers.push(userResult);
+          results.summary.windowsAffected++;
         }
-        
-        results.windowsUsers.push(userResult);
-        results.summary.windowsAffected++;
       }
+      
+      console.log(`[admin/cleanup] Found ${results.windowsUsers.length} Windows users with excess devices`);
     }
     
     // ===== LINUX CLEANUP =====
     if (platform === 'all' || platform === 'linux') {
-      // Find users with too many Linux devices
-      const linuxUsers = await prisma.$queryRaw`
-        SELECT 
-          u.id as userId,
-          u.email,
-          u.maxLinuxDevices as deviceLimit,
-          COUNT(ad.id) as activeDeviceCount
-        FROM User u
-        INNER JOIN AuthorizedDevice ad ON ad.userId = u.id
-        WHERE ad.active = true 
-          AND ad.appType = 'commander'
-          AND LOWER(ad.platform) LIKE '%linux%'
-        GROUP BY u.id, u.email, u.maxLinuxDevices
-        HAVING COUNT(ad.id) > u.maxLinuxDevices
-      `;
+      // Get all users
+      const allUsers = await prisma.user.findMany({
+        select: {
+          id: true,
+          email: true,
+          maxLinuxDevices: true
+        }
+      });
       
-      console.log(`[admin/cleanup] Found ${linuxUsers.length} Linux users with excess devices`);
+      console.log(`[admin/cleanup] Checking ${allUsers.length} users for Linux device violations`);
       
-      for (const user of linuxUsers) {
-        const excessCount = user.activeDeviceCount - user.deviceLimit;
-        
-        // Get all Linux devices for this user, ordered by lastSeenAt (oldest first)
-        const devices = await prisma.authorizedDevice.findMany({
+      for (const user of allUsers) {
+        // Count active Linux devices for this user
+        const activeDeviceCount = await prisma.authorizedDevice.count({
           where: {
-            userId: user.userId,
+            userId: user.id,
             appType: 'commander',
             active: true,
             platform: { contains: 'linux', mode: 'insensitive' }
-          },
-          orderBy: { lastSeenAt: 'asc' },
-          take: excessCount
+          }
         });
         
-        const userResult = {
-          email: user.email,
-          userId: user.userId,
-          limit: user.deviceLimit,
-          activeCount: user.activeDeviceCount,
-          excessCount: excessCount,
-          devicesToDeactivate: devices.map(d => ({
-            id: d.id,
-            deviceId: d.deviceId,
-            deviceName: d.deviceName,
-            registeredAt: d.registeredAt,
-            lastSeenAt: d.lastSeenAt
-          }))
-        };
-        
-        // If NOT dry-run, deactivate
-        if (!dryRun) {
-          for (const device of devices) {
-            await prisma.authorizedDevice.update({
-              where: { id: device.id },
-              data: { active: false }
-            });
+        // Check if over limit
+        if (activeDeviceCount > user.maxLinuxDevices) {
+          const excessCount = activeDeviceCount - user.maxLinuxDevices;
+          
+          // Get all Linux devices for this user, ordered by lastSeenAt (oldest first)
+          const devices = await prisma.authorizedDevice.findMany({
+            where: {
+              userId: user.id,
+              appType: 'commander',
+              active: true,
+              platform: { contains: 'linux', mode: 'insensitive' }
+            },
+            orderBy: { lastSeenAt: 'asc' },
+            take: excessCount
+          });
+          
+          const userResult = {
+            email: user.email,
+            userId: user.id,
+            limit: user.maxLinuxDevices,
+            activeCount: activeDeviceCount,
+            excessCount: excessCount,
+            devicesToDeactivate: devices.map(d => ({
+              id: d.id,
+              deviceId: d.deviceId,
+              deviceName: d.deviceName,
+              registeredAt: d.registeredAt,
+              lastSeenAt: d.lastSeenAt
+            }))
+          };
+          
+          // If NOT dry-run, deactivate
+          if (!dryRun) {
+            for (const device of devices) {
+              await prisma.authorizedDevice.update({
+                where: { id: device.id },
+                data: { active: false }
+              });
+              
+              await prisma.deviceAuditLog.create({
+                data: {
+                  id: `dal_cleanup_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                  userId: user.id,
+                  deviceId: device.deviceId,
+                  appType: 'commander',
+                  action: 'deactivated_excess',
+                  ipAddress: 'admin_cleanup'
+                }
+              });
+              
+              console.log(`[admin/cleanup] Deactivated device ${device.deviceName} for ${user.email}`);
+            }
             
-            await prisma.deviceAuditLog.create({
-              data: {
-                id: `dal_cleanup_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                userId: user.userId,
-                deviceId: device.deviceId,
-                appType: 'commander',
-                action: 'deactivated_excess',
-                ipAddress: 'admin_cleanup'
-              }
-            });
-            
-            console.log(`[admin/cleanup] Deactivated device ${device.deviceName} for ${user.email}`);
+            results.summary.totalDevicesDeactivated += devices.length;
           }
           
-          results.summary.totalDevicesDeactivated += devices.length;
+          results.linuxUsers.push(userResult);
+          results.summary.linuxAffected++;
         }
-        
-        results.linuxUsers.push(userResult);
-        results.summary.linuxAffected++;
       }
+      
+      console.log(`[admin/cleanup] Found ${results.linuxUsers.length} Linux users with excess devices`);
     }
     
     // Summary
