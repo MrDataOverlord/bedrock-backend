@@ -46,8 +46,34 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({
+  log: NODE_ENV === 'development' ? ['query', 'warn', 'error'] : ['warn', 'error'],
+});
 const stripe = new Stripe(STRIPE_SECRET_KEY);
+// Graceful shutdown handlers
+process.on('SIGINT', async () => {
+  console.log('[shutdown] SIGINT received, closing connections...');
+  await prisma.$disconnect();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('[shutdown] SIGTERM received, closing connections...');
+  await prisma.$disconnect();
+  process.exit(0);
+});
+
+process.on('uncaughtException', async (error) => {
+  console.error('[fatal] Uncaught exception:', error);
+  await prisma.$disconnect();
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+  console.error('[fatal] Unhandled rejection at:', promise, 'reason:', reason);
+  await prisma.$disconnect();
+  process.exit(1);
+});
 
 // CORS
 const allowed = (CORS_ORIGINS || 'https://nerdherdmc.net,https://www.nerdherdmc.net')
@@ -73,6 +99,15 @@ app.use(rateLimit({
   legacyHeaders: false,
   skip: (req) => req.path === '/health' || req.path.startsWith('/webhooks/'),
 }));
+
+// Health check that doesn't query database
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
 
 // ---------- utilities ----------
 const log = (...a) => console.log(...a);
