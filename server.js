@@ -1676,6 +1676,25 @@ app.post('/devices/replace', auth, async (req, res) => {
     if (!targetDeviceId || !newDeviceId || !appType || !platform) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
+    // Prevent self-replacement
+if (targetDeviceId === newDeviceId) {
+  console.log(`[device/replace] Blocked self-replacement attempt by ${userId}`);
+  return res.status(400).json({ 
+    error: 'Cannot replace device with itself',
+    code: 'SELF_REPLACEMENT_BLOCKED',
+    message: 'Device IDs are identical. Contact support if experiencing authorization issues.'
+  });
+}
+    // ⭐ NEW: Prevent self-replacement (wasting tokens)
+    if (targetDeviceId === newDeviceId) {
+      console.log(`[device/replace] User ${userId} attempted to replace device with itself - blocked`);
+      return res.status(400).json({ 
+        error: 'Cannot replace device with itself',
+        code: 'SELF_REPLACEMENT_BLOCKED',
+        message: 'The target device and new device are identical. If you are experiencing authorization issues, this may be due to a hardware fingerprint mismatch. Please contact support for assistance.',
+        suggestion: 'Try refreshing the device list or contact support if the problem persists.'
+      });
+    }
     
     console.log(`[device/replace] User ${userId} replacing ${targetDeviceId} with ${newDeviceId}`);
     
@@ -3310,10 +3329,60 @@ if (user && (sub.status === 'active' || sub.status === 'trialing')) {
 break;
       }
       
-      case 'invoice.payment_succeeded':
-      case 'invoice.payment_failed':
-        // Optional: refresh via invoice.subscription
-        break;
+      case 'invoice.payment_succeeded': {
+  const invoice = event.data.object;
+  console.log('[webhook] Invoice payment succeeded:', invoice.id);
+  
+  try {
+    // Get customer email
+    const customer = await getStripeCustomer(invoice.customer);
+    const email = customer?.email?.toLowerCase()?.trim();
+    
+    if (!email) {
+      console.log('[webhook] No email found for customer, skipping token refresh');
+      break;
+    }
+    
+    // Find user by email
+    const user = await prisma.user.findUnique({ where: { email } });
+    
+    if (!user) {
+      console.log(`[webhook] No user found for email ${email}, skipping token refresh`);
+      break;
+    }
+    
+    // ⭐ MONTHLY TOKEN REFRESH: Grant 2 fresh tokens on successful payment
+    console.log(`[webhook] Refreshing reset tokens for user ${user.id} (${email}) after successful payment`);
+    
+    await prisma.deviceResetToken.upsert({
+      where: { userId: user.id },
+      update: {
+        tokensRemaining: 2,
+        lastResetAt: null,
+        updatedAt: new Date()
+      },
+      create: {
+        id: `drt_${user.id}_${Date.now()}`,
+        userId: user.id,
+        tokensRemaining: 2,
+        lastResetAt: null,
+        createdAt: new Date(),
+        updatedAt: new Date()
+      }
+    });
+    
+    console.log(`[webhook] ✅ Reset tokens refreshed to 2/2 for ${email}`);
+    
+  } catch (error) {
+    console.error('[webhook] Error refreshing tokens on payment success:', error);
+  }
+  
+  break;
+}
+
+case 'invoice.payment_failed':
+  // Optional: could add logic here to notify user of payment failure
+  break;
       
       default:
         break;
