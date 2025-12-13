@@ -3495,7 +3495,7 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
         },
         include: { NotificationRule: true }
       });
-
+    }
     // ✅ Keep "rules" in response, use NotificationRule for data access
     const response = {
       soundEnabled: settings.soundEnabled,
