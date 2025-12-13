@@ -2006,6 +2006,7 @@ app.post('/admin/grant_premium', adminAuth, async (req, res) => {
         id: `ns_${user.id}_${Date.now()}`,
         userId: user.id,
         soundEnabled: false,
+        windowsNotificationsEnabled: true,
         updatedAt: new Date(),
         NotificationRule: {
           create: defaultRules.map((rule, index) => ({
@@ -2133,6 +2134,7 @@ app.post('/admin/create_account', adminAuth, async (req, res) => {
           id: `ns_${user.id}_${Date.now()}`,
           userId: user.id,
           soundEnabled: false,
+          windowsNotificationsEnabled: true,
           updatedAt: new Date(),
           NotificationRule: {
             create: defaultRules.map((rule, index) => ({
@@ -3247,6 +3249,7 @@ app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (r
         id: `ns_${user.id}_${Date.now()}`,
         userId: user.id,
         soundEnabled: false,
+        windowsNotificationsEnabled: true,
         updatedAt: new Date(),
         NotificationRule: {
           create: defaultRules.map((rule, index) => ({
@@ -3478,26 +3481,27 @@ app.get('/premium/notifications/settings', auth, async (req, res) => {
       
       settings = await prisma.notificationSettings.create({
         data: {
-          id: `ns_${userId}`,  // ✅ Use simple ID
+          id: `ns_${userId}`,
           userId,
           soundEnabled: false,
+          windowsNotificationsEnabled: true, // ⭐ ADD THIS LINE - default to enabled
           updatedAt: new Date(),
-          NotificationRule: {  // ✅ Prisma field
+          NotificationRule: {
             create: defaultRules.map((rule, index) => ({
               id: `nr_${userId}_${Date.now()}_${index}`,
               ...rule
             }))
           }
         },
-        include: { NotificationRule: true }  // ✅ Prisma field
+        include: { NotificationRule: true }
       });
-    }
 
-    // ✅ CRITICAL FIX: Keep "rules" in response, use NotificationRule for data access
+    // ✅ Keep "rules" in response, use NotificationRule for data access
     const response = {
       soundEnabled: settings.soundEnabled,
-      rules: {  // ✅ API response uses "rules"
-        rules: settings.NotificationRule.map(rule => ({  // ✅ Access via NotificationRule
+      windowsNotificationsEnabled: settings.windowsNotificationsEnabled ?? true, // ⭐ ADD THIS LINE - default to true
+      rules: {
+        rules: settings.NotificationRule.map(rule => ({
           name: rule.name,
           type: rule.type,
           pattern: rule.pattern,
@@ -3740,6 +3744,56 @@ await prisma.notificationSettings.upsert({
   } catch (e) {
     console.error('[premium/notifications/sound] error:', e?.message || e);
     res.status(500).json({ error: 'Failed to update notification settings' });
+  }
+});
+
+// Enable/disable Windows notifications
+app.put('/premium/notifications/windows', auth, async (req, res) => {
+  try {
+    const userId = req.user.sub;
+    const deviceId = req.headers['x-device-id'];
+    const { windowsNotificationsEnabled } = req.body || {};
+
+    console.log('[WINDOWS_NOTIFICATIONS] User:', userId, 'Device:', deviceId, 'Enabled:', windowsNotificationsEnabled);
+
+    // Verify premium status
+    const hasPremium = await userHasActivePremium(userId);
+    if (!hasPremium) {
+      return res.status(403).json({ error: 'Premium subscription required' });
+    }
+
+    // Verify device authorization
+    const isDeviceAuthorized = await verifyDeviceAuthorization(userId, deviceId);
+    if (!isDeviceAuthorized && deviceId) {
+      console.log('[WINDOWS_NOTIFICATIONS] Device not authorized');
+      return res.status(403).json({ error: 'Device not authorized. Please manage your devices.' });
+    }
+
+    // Save the setting
+    await prisma.notificationSettings.upsert({
+      where: { userId },
+      create: { 
+        id: `ns_${userId}_${Date.now()}`,
+        userId, 
+        soundEnabled: false,
+        windowsNotificationsEnabled: Boolean(windowsNotificationsEnabled),
+        updatedAt: new Date()
+      },
+      update: { 
+        windowsNotificationsEnabled: Boolean(windowsNotificationsEnabled),
+        updatedAt: new Date()
+      }
+    });
+
+    console.log('[WINDOWS_NOTIFICATIONS] Successfully updated to:', Boolean(windowsNotificationsEnabled));
+
+    res.json({ 
+      success: true, 
+      windowsNotificationsEnabled: Boolean(windowsNotificationsEnabled) 
+    });
+  } catch (e) {
+    console.error('[premium/notifications/windows] error:', e?.message || e);
+    res.status(500).json({ error: 'Failed to update Windows notification settings' });
   }
 });
 
