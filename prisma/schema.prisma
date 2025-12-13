@@ -94,6 +94,7 @@ model NotificationSettings {
   id               String             @id
   userId           String             @unique
   soundEnabled     Boolean            @default(false)
+  windowsNotificationsEnabled Boolean            @default(true)  ← NEW LINE
   createdAt        DateTime           @default(now())
   updatedAt        DateTime           @default(now())
   NotificationRule NotificationRule[]
